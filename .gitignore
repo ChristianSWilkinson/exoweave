@@ -29,3 +29,6 @@ test_run.csv
 *.h5
 *.nml
 *.pkl
+
+# Readme generator
+generate_readme.py
