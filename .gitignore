@@ -1,0 +1,31 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and Package builds
+*.egg-info/
+build/
+dist/
+.env
+venv/
+env/
+
+# Mac OS clutter
+.DS_Store
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data and outputs
+data/
+exoweave_outputs/
+
+# ExoWeave / FuzzyCore specific outputs
+results/
+failed/
+solver_steps.csv
+test_run.csv
+*.h5
+*.nml
+*.pkl
