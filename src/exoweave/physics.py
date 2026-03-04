@@ -5,10 +5,11 @@ import pandas as pd
 from exowrap.output import ExoremOut
 from fuzzycore.constants import BAR_TO_PA, SIGMA_SB
 from fuzzycore.utils import calculate_staircase_dt_ds
+from fuzzycore.constants import G_CONST
 
 def calculate_new_tint(
     atm_out: ExoremOut, 
-    pressure_threshold_bar: float = 100.0, 
+    pressure_threshold_bar: float = 10.0, 
     fallback_t_int: float = 500.0
 ) -> float:
     """
@@ -106,3 +107,142 @@ def calculate_entropy_evolution(int_results: dict, t_int: float) -> dict:
         'L_int': float(l_int),
         'layer_contributions': cooling_data.get('layer_contributions', {})
     }
+
+
+def calculate_z_base(atm_out, p_link_bar: float, fallback_met: float = 0.0) -> tuple[float, float]:
+    """
+    Calculates the heavy element mass fraction (Z) and the Helium-to-(Hydrogen+Helium) 
+    mass ratio (Y_ratio) at the linking boundary.
+    
+    Args:
+        atm_out (ExoremOut): The parsed ExoREM atmosphere outputs.
+        p_link_bar (float): The pressure boundary (in bar) to extract from.
+        fallback_met (float): The input metallicity [Fe/H] to use as a fallback 
+                              if VMR extraction fails.
+                              
+    Returns:
+        tuple[float, float]: A tuple containing (Z, Y_ratio).
+    """
+    import logging
+    import numpy as np
+    
+    logging.debug(f"Calculating Z_base and Y_ratio from atmospheric VMRs at {p_link_bar} bar.")
+    
+    try:
+        # Find the atmospheric layer closest to the linking pressure
+        p_layers_bar = atm_out.pressure_profile / 1e5
+        lay_idx = np.argmin(np.abs(p_layers_bar - p_link_bar))
+        
+        # Total mean molar mass of the mixture at this layer (kg/mol)
+        mu = atm_out.mean_molar_mass[lay_idx]
+        
+        # Standard Molar Masses (kg/mol)
+        M_H2 = 2.01588e-3
+        M_He = 4.00260e-3
+        M_H  = 1.00784e-3
+        
+        # Retrieve all VMR profiles (absorbers, gases, etc.)
+        all_vmrs = atm_out.vmr_profiles
+        
+        vmr_h2, vmr_he, vmr_h = 0.0, 0.0, 0.0
+        
+        # Safely extract H2, He, and H regardless of their dictionary prefix
+        for key, vmr_array in all_vmrs.items():
+            if key.endswith(':H2') or key == 'H2':
+                vmr_h2 = vmr_array[lay_idx]
+            elif key.endswith(':He') or key == 'He':
+                vmr_he = vmr_array[lay_idx]
+            elif key.endswith(':H') or key == 'H':
+                vmr_h = vmr_array[lay_idx]
+                
+        # Calculate Absolute Mass Fractions (X = Hydrogen, Y = Helium)
+        # Equation: Mass_Fraction = (VMR * Molar_Mass_Species) / Mean_Molar_Mass
+        X = ((vmr_h2 * M_H2) + (vmr_h * M_H)) / mu
+        Y = (vmr_he * M_He) / mu
+        
+        # Z is the mass fraction of all remaining heavy elements
+        Z = 1.0 - (X + Y)
+        
+        # Clean numerical noise (ensure it's between 0 and 0.99)
+        Z = max(min(Z, 0.99), 0.0)
+        
+        # If VMRs were totally missing (Z ≈ 1.0), trigger the fallback
+        if Z > 0.98 and vmr_h2 == 0.0:
+            raise ValueError("H2/He VMRs not found in ExoREM output.")
+            
+        # Calculate the internal Y_ratio (Y / (X + Y)) for the EOS mixer
+        if (X + Y) > 0:
+            Y_ratio = Y / (X + Y)
+        else:
+            Y_ratio = 0.26 # Fallback to proto-solar if atmosphere is purely heavy elements
+            
+        logging.info(f"🧪 Chemical Sync: Derived Z_base = {Z:.4f}, Y_ratio = {Y_ratio:.4f} (from X={X:.4f}, Y={Y:.4f})")
+        return float(Z), float(Y_ratio)
+
+    except Exception as e:
+        # Fallback: Approximate Z from the bulk atmospheric metallicity input
+        fallback_z = min(0.015 * (10 ** fallback_met), 0.99)
+        fallback_y_ratio = 0.26 # Proto-solar fallback
+        logging.warning(f"⚠️ Failed to extract Z and Y_ratio from VMRs ({e}). Using fallbacks: Z ≈ {fallback_z:.4f}, Y_ratio = {fallback_y_ratio}")
+        return float(fallback_z), float(fallback_y_ratio)
+
+
+def calculate_stitched_mass(atm_out, int_results: dict, p_link_bar: float) -> tuple[float, float, float]:
+    """
+    Calculates the precise total planetary mass by integrating the atmospheric 
+    envelope's mass shell-by-shell and adding it to the interior core mass.
+    
+    Args:
+        atm_out (ExoremOut): The parsed ExoREM atmosphere outputs.
+        int_results (dict): The converged fuzzycore interior results.
+        p_link_bar (float): The pressure boundary (in bar) where the models link.
+        
+    Returns:
+        tuple: (total_mass_kg, interior_mass_kg, atm_mass_kg)
+    """
+    
+    # 1. Extract the interior properties exactly at the junction
+    interior_mass_kg = int_results['M'][-1]
+    r_link_m = int_results['R'][-1]
+    
+    # 2. Get the atmospheric layer arrays natively from ExoREM
+    p_layers_pa = atm_out.pressure_profile
+    rho_layers = atm_out.density_profile
+    
+    # 3. Filter arrays to only include the atmosphere ABOVE the junction
+    mask = p_layers_pa <= (p_link_bar * 1e5)
+    p_atm = p_layers_pa[mask]
+    rho_atm = rho_layers[mask]
+    
+    # Sort from bottom (highest pressure) to top (lowest pressure)
+    sort_idx = np.argsort(p_atm)[::-1]
+    p_atm = p_atm[sort_idx]
+    rho_atm = rho_atm[sort_idx]
+    
+    # 4. Generate pressure boundaries (edges) for each layer
+    edges = [p_link_bar * 1e5]
+    for i in range(len(p_atm) - 1):
+        edges.append((p_atm[i] + p_atm[i+1]) / 2.0)
+    edges.append(p_atm[-1] * 0.5)
+    
+    # 5. Numerically integrate dm and dr shell-by-shell up to space
+    m_current = interior_mass_kg
+    r_current = r_link_m
+    m_atm_kg = 0.0
+    
+    for i in range(len(p_atm)):
+        p_bottom = edges[i]
+        p_top = edges[i+1]
+        dp = p_top - p_bottom  # Negative value
+        
+        rho_layer = rho_atm[i]
+        
+        # Calculate thickness and mass of this shell
+        dr = -dp * (r_current**2) / (rho_layer * G_CONST * m_current)
+        dm = 4 * np.pi * (r_current**2) * rho_layer * dr
+        
+        r_current += dr
+        m_current += dm
+        m_atm_kg += dm
+        
+    return m_current, interior_mass_kg, m_atm_kg

@@ -2,54 +2,68 @@ import logging
 import pickle as pkl
 from pathlib import Path
 from datetime import datetime
-import pandas as pd
 
-def _generate_filename(params: dict, suffix: str = "") -> str:
+def _generate_filename(params: dict, actual_mass: float = None, suffix: str = "") -> str:
     """
-    Generates a consistent filename based on the physical parameters.
-    Replaces the old _generate_param_string method.
+    Generates an exhaustive, non-confusable filename based on the physical parameters.
+    If actual_mass is provided (for intermediate steps), it overrides the target mass.
     """
-    mass = params.get('mass', 'NaN')
-    t_int = params.get('T_int', 'NaN')
-    met = params.get('Met', 'NaN')
+    mass = actual_mass if actual_mass is not None else params.get('mass', 0.0)
+    t_irr = params.get('T_irr', 0.0)
+    t_int = params.get('T_int', 0.0)
+    met = params.get('Met', 0.0)
+    core = params.get('core_mass_earth', 0.0)
+    fsed = params.get('f_sed', 0.0)
+    kzz = params.get('kzz', 0.0)
     
-    # Format: M_1.00_Tint_500.0_Met_0.00
-    base = f"M_{mass:.2f}_Tint_{t_int:.1f}_Met_{met:.2f}"
+    # Format: M_1.000_Tirr_100.0_Tint_500.0_Met_0.00_Core_15.0_fsed_1.0_kzz_8.0
+    base = (f"M_{mass:.3f}_Tirr_{t_irr:.1f}_Tint_{t_int:.1f}_"
+            f"Met_{met:.2f}_Core_{core:.1f}_fsed_{fsed:.1f}_kzz_{kzz:.1f}")
     
     if suffix:
         return f"{base}_{suffix}.pkl"
     return f"{base}.pkl"
 
+def save_step_model(step_data: dict, output_dir: str | Path) -> Path:
+    """
+    Saves an intermediate, valid iteration step to the 'steps' subfolder.
+    """
+    out_dir = Path(output_dir) / "steps"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    params = step_data.get('parameters', {})
+    iteration = step_data.get('iteration', 0)
+    actual_mass = step_data.get('mass_calculated_mjup')
+    
+    filename = _generate_filename(params, actual_mass=actual_mass, suffix=f"iter_{iteration}")
+    filepath = out_dir / filename
+    
+    try:
+        with open(filepath, 'wb') as f:
+            pkl.dump(step_data, f)
+        logging.debug(f"💾 Step {iteration} saved to: {filepath}")
+        return filepath
+    except Exception as e:
+        logging.error(f"❌ Failed to save step model: {e}", exc_info=True)
+        return None
+
 def save_converged_model(results: dict, output_dir: str | Path, custom_name: str = None) -> Path:
     """
-    Saves a converged planetary model to disk. 
-    
-    Instead of stuffing arrays into a DataFrame cell, it saves a structured 
-    dictionary containing the clean stitched DataFrame, the raw outputs, 
-    and the parameters.
-    
-    Args:
-        results (dict): The output dictionary from ExoCoupler.run().
-        output_dir (str | Path): The directory to save the file in.
-        custom_name (str, optional): Override the default generated filename.
-        
-    Returns:
-        Path: The exact path where the file was saved.
+    Saves a finalized, converged planetary model to the 'target' subfolder.
     """
-    out_dir = Path(output_dir) / "results"
+    out_dir = Path(output_dir) / "target"
     out_dir.mkdir(parents=True, exist_ok=True)
     
     params = results.get('final_params', {})
     filename = custom_name if custom_name else _generate_filename(params)
     filepath = out_dir / filename
     
-    # Structure the data cleanly
     data_to_save = {
         'status': 'converged',
         'timestamp': datetime.now().isoformat(),
         'parameters': params,
         'iterations': results.get('iterations'),
-        'profile': results.get('stitched_profile'), # The clean pd.DataFrame
+        'profile': results.get('stitched_profile'), 
         'atmosphere_raw': results.get('atmosphere_raw'),
         'interior_raw': results.get('interior_raw')
     }
@@ -65,17 +79,7 @@ def save_converged_model(results: dict, output_dir: str | Path, custom_name: str
 
 def save_failed_run(history: dict, params: dict, reason: str, output_dir: str | Path) -> Path:
     """
-    Logs and saves the parameter history of a failed run for debugging.
-    Replaces the old _handle_simulation_failure method.
-    
-    Args:
-        history (dict): The iteration history dictionary from the coupler.
-        params (dict): The target physical parameters.
-        reason (str): Why the simulation failed (e.g., "Max iterations reached").
-        output_dir (str | Path): The root output directory.
-        
-    Returns:
-        Path: The exact path where the failure log was saved.
+    Logs and saves the parameter history of a failed run into a 'failed' subfolder.
     """
     fail_dir = Path(output_dir) / "failed"
     fail_dir.mkdir(parents=True, exist_ok=True)
