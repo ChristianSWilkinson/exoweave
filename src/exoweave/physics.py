@@ -3,69 +3,45 @@ import numpy as np
 import pandas as pd
 
 from exowrap.output import ExoremOut
+from exowrap.photometry import get_svo_filter
 from fuzzycore.constants import BAR_TO_PA, SIGMA_SB
 from fuzzycore.utils import calculate_staircase_dt_ds
 from fuzzycore.constants import G_CONST
 
 def calculate_new_tint(
-    atm_out: ExoremOut, 
+    atm_out, 
     pressure_threshold_bar: float = 10.0, 
-    fallback_t_int: float = 500.0
+    fallback_t_int: float = np.nan
 ) -> float:
     """
-    Calculates the Intrinsic Temperature (T_int) based on the average 
-    upward thermal flux within the deepest convective zone.
+    Calculates the true Intrinsic Temperature (T_int) by isolating ExoREM's 
+    explicit internal heat flux tracker (radiosity_internal) deep in the atmosphere.
     """
-    logging.debug("Calculating T_int from average flux in deepest convective zone.")
+    logging.debug("Extracting true T_int from deep internal radiosity...")
     
     try:
-        p_pa = np.asarray(atm_out.df['/outputs/levels/pressure'].iloc[0])
-        is_conv = np.asarray(atm_out.df['/outputs/levels/is_convective'].iloc[0]).astype(bool)
-        rad_int = np.asarray(atm_out.df['/outputs/levels/radiosity_internal'].iloc[0])
-        rad_conv = np.asarray(atm_out.df['/outputs/levels/radiosity_convective'].iloc[0])
+        df = atm_out.df
+        p_pa = np.asarray(df['/outputs/levels/pressure'].iloc[0])
         
-        p_threshold_pa = pressure_threshold_bar * BAR_TO_PA
+        # ExoREM perfectly isolates the net internal heat flux in this array!
+        rad_int = np.asarray(df['/outputs/levels/radiosity_internal'].iloc[0])
         
-        candidate_indices = np.where((is_conv) & (p_pa >= p_threshold_pa))[0]
-
-        if candidate_indices.size == 0:
-            return fallback_t_int
-
-        convective_zones = []
-        current_zone_start = -1
+        # Mask for the deep atmosphere to avoid upper atmospheric noise
+        p_threshold_pa = pressure_threshold_bar * 1e5
+        deep_mask = p_pa >= p_threshold_pa
         
-        for i in range(len(p_pa)):
-            if i in candidate_indices:
-                if current_zone_start == -1:
-                    current_zone_start = i
-            else:
-                if current_zone_start != -1:
-                    convective_zones.append((current_zone_start, i - 1))
-                    current_zone_start = -1
-                    
-        if current_zone_start != -1:
-            convective_zones.append((current_zone_start, len(p_pa) - 1))
+        if np.any(deep_mask):
+            avg_internal_flux = np.nanmean(rad_int[deep_mask])
             
-        if not convective_zones:
-            return fallback_t_int
-            
-        deepest_zone = max(convective_zones, key=lambda zone: zone[0])
-        start_idx, end_idx = deepest_zone
+            if avg_internal_flux > 0:
+                t_int_comp = (avg_internal_flux / 5.67e-8) ** 0.25
+                return float(t_int_comp)
 
-        total_flux_profile = rad_int + rad_conv
-        flux_in_zone = total_flux_profile[start_idx : end_idx + 1]
-        
-        avg_flux = np.nanmean(flux_in_zone)
-        
-        if pd.notna(avg_flux) and avg_flux >= 0:
-            t_int_comp = (avg_flux / SIGMA_SB) ** 0.25
-            logging.info(f"Calculated T_int: {t_int_comp:.2f} K (Avg Deep Flux = {avg_flux:.3e} W/m²)")
-            return float(t_int_comp)
-        else:
-            return fallback_t_int
+        # Only used if the entire array is negative/corrupted
+        return fallback_t_int
 
     except Exception as e:
-        logging.error(f"Error calculating T_int from convective zone: {e}", exc_info=True)
+        logging.error(f"⚠️ Error verifying T_int: {e}. Falling back to dial value.")
         return fallback_t_int
 
 
@@ -108,25 +84,13 @@ def calculate_entropy_evolution(int_results: dict, t_int: float) -> dict:
         'layer_contributions': cooling_data.get('layer_contributions', {})
     }
 
-
 def calculate_z_base(atm_out, p_link_bar: float, fallback_met: float = 0.0) -> tuple[float, float]:
     """
     Calculates the heavy element mass fraction (Z) and the Helium-to-(Hydrogen+Helium) 
     mass ratio (Y_ratio) at the linking boundary.
-    
-    Args:
-        atm_out (ExoremOut): The parsed ExoREM atmosphere outputs.
-        p_link_bar (float): The pressure boundary (in bar) to extract from.
-        fallback_met (float): The input metallicity [Fe/H] to use as a fallback 
-                              if VMR extraction fails.
-                              
-    Returns:
-        tuple[float, float]: A tuple containing (Z, Y_ratio).
     """
-    import logging
-    import numpy as np
     
-    logging.debug(f"Calculating Z_base and Y_ratio from atmospheric VMRs at {p_link_bar} bar.")
+    logging.info(f"Calculating Z_base and Y_ratio from atmospheric VMRs at {p_link_bar} bar.")
     
     try:
         # Find the atmospheric layer closest to the linking pressure
@@ -141,30 +105,26 @@ def calculate_z_base(atm_out, p_link_bar: float, fallback_met: float = 0.0) -> t
         M_He = 4.00260e-3
         M_H  = 1.00784e-3
         
-        # Retrieve all VMR profiles (absorbers, gases, etc.)
         all_vmrs = atm_out.vmr_profiles
-        
         vmr_h2, vmr_he, vmr_h = 0.0, 0.0, 0.0
         
-        # Safely extract H2, He, and H regardless of their dictionary prefix
+        # Safely extract VMRs using the exact path
+        # This completely avoids the 'elements_gas_phase' atomic counters!
         for key, vmr_array in all_vmrs.items():
-            if key.endswith(':H2') or key == 'H2':
+            if key == 'gas:H2':
                 vmr_h2 = vmr_array[lay_idx]
-            elif key.endswith(':He') or key == 'He':
+            elif key == 'gas:He':
                 vmr_he = vmr_array[lay_idx]
-            elif key.endswith(':H') or key == 'H':
+            elif key == 'gas:H':
                 vmr_h = vmr_array[lay_idx]
                 
         # Calculate Absolute Mass Fractions (X = Hydrogen, Y = Helium)
-        # Equation: Mass_Fraction = (VMR * Molar_Mass_Species) / Mean_Molar_Mass
         X = ((vmr_h2 * M_H2) + (vmr_h * M_H)) / mu
         Y = (vmr_he * M_He) / mu
-        
-        # Z is the mass fraction of all remaining heavy elements
-        Z = 1.0 - (X + Y)
+        raw_Z = 1.0 - (X + Y)
         
         # Clean numerical noise (ensure it's between 0 and 0.99)
-        Z = max(min(Z, 0.99), 0.0)
+        Z = max(min(raw_Z, 0.99), 0.0)
         
         # If VMRs were totally missing (Z ≈ 1.0), trigger the fallback
         if Z > 0.98 and vmr_h2 == 0.0:
@@ -185,7 +145,7 @@ def calculate_z_base(atm_out, p_link_bar: float, fallback_met: float = 0.0) -> t
         fallback_y_ratio = 0.26 # Proto-solar fallback
         logging.warning(f"⚠️ Failed to extract Z and Y_ratio from VMRs ({e}). Using fallbacks: Z ≈ {fallback_z:.4f}, Y_ratio = {fallback_y_ratio}")
         return float(fallback_z), float(fallback_y_ratio)
-
+    
 
 def calculate_stitched_mass(atm_out, int_results: dict, p_link_bar: float) -> tuple[float, float, float]:
     """
@@ -246,3 +206,125 @@ def calculate_stitched_mass(atm_out, int_results: dict, p_link_bar: float) -> tu
         m_atm_kg += dm
         
     return m_current, interior_mass_kg, m_atm_kg
+
+# Global cache to prevent spamming the SVO servers!
+# Stores filters as: {'filter_id': (wav_microns_array, transmission_array)}
+_FILTER_CACHE = {}
+
+def calculate_comprehensive_photometry(atm_out) -> dict:
+    """
+    Extracts raw spectral arrays and computes synthetic photometry across a 
+    massive catalog of JWST, VLT, Keck, HST, and survey filters. Uses an 
+    in-memory cache to prevent IP bans from the SVO Filter Profile Service.
+    """
+    logging.info("🌟 Computing Mega-Catalog Photometry (Cached)...")
+    
+    # ---------------------------------------------------------
+    # THE ULTIMATE EXOPLANET & BROWN DWARF FILTER CATALOG
+    # ---------------------------------------------------------
+    target_filters = [
+        # --- JWST ---
+        "JWST/NIRCam.F070W", "JWST/NIRCam.F090W", "JWST/NIRCam.F115W", "JWST/NIRCam.F140M", 
+        "JWST/NIRCam.F150W", "JWST/NIRCam.F182M", "JWST/NIRCam.F200W", "JWST/NIRCam.F210M", 
+        "JWST/NIRCam.F250M", "JWST/NIRCam.F277W", "JWST/NIRCam.F300M", "JWST/NIRCam.F335M", 
+        "JWST/NIRCam.F356W", "JWST/NIRCam.F410M", "JWST/NIRCam.F430M", "JWST/NIRCam.F444W", 
+        "JWST/NIRCam.F460M", "JWST/NIRCam.F480M",
+        "JWST/MIRI.F560W", "JWST/MIRI.F770W", "JWST/MIRI.F1000W", "JWST/MIRI.F1130W", 
+        "JWST/MIRI.F1280W", "JWST/MIRI.F1500W", "JWST/MIRI.F1800W", "JWST/MIRI.F2100W", "JWST/MIRI.F2550W",
+        "JWST/NIRISS.F090W", "JWST/NIRISS.F115W", "JWST/NIRISS.F140M", "JWST/NIRISS.F150W", 
+        "JWST/NIRISS.F158M", "JWST/NIRISS.F200W", "JWST/NIRISS.F277W", "JWST/NIRISS.F380M", 
+        "JWST/NIRISS.F430M", "JWST/NIRISS.F480M",
+        
+        # --- VLT (Paranal) ---
+        "Paranal/SPHERE.IRDIS_B_Y", "Paranal/SPHERE.IRDIS_B_J", "Paranal/SPHERE.IRDIS_B_H", "Paranal/SPHERE.IRDIS_B_Ks",
+        "Paranal/SPHERE.IRDIS_D_J23_2", "Paranal/SPHERE.IRDIS_D_J23_3", 
+        "Paranal/SPHERE.IRDIS_D_H23_2", "Paranal/SPHERE.IRDIS_D_H23_3", 
+        "Paranal/SPHERE.IRDIS_D_K12_1", "Paranal/SPHERE.IRDIS_D_K12_2",
+        "Paranal/NACO.J", "Paranal/NACO.H", "Paranal/NACO.Ks", "Paranal/NACO.Lp", "Paranal/NACO.Mp",
+        "Paranal/HAWKI.J", "Paranal/HAWKI.H", "Paranal/HAWKI.Ks", "Paranal/HAWKI.CH4",
+        "Paranal/VISIR.B8_7", "Paranal/VISIR.B10_7", "Paranal/VISIR.B11_7", "Paranal/VISIR.Q2",
+        
+        # --- KECK & GEMINI ---
+        "Keck/NIRC2.J", "Keck/NIRC2.H", "Keck/NIRC2.Ks", "Keck/NIRC2.Kp", "Keck/NIRC2.Lp", "Keck/NIRC2.Ms",
+        "Gemini/NIRI.J", "Gemini/NIRI.H", "Gemini/NIRI.K", "Gemini/NIRI.L-prime", "Gemini/NIRI.M-prime",
+        
+        # --- SPACE: HST, SPITZER, WISE ---
+        "HST/WFC3_IR.F110W", "HST/WFC3_IR.F140W", "HST/WFC3_IR.F160W", "HST/WFC3_UVIS1.F606W", "HST/WFC3_UVIS1.F814W",
+        "Spitzer/IRAC.I1", "Spitzer/IRAC.I2", "Spitzer/IRAC.I3", "Spitzer/IRAC.I4",
+        "WISE/WISE.W1", "WISE/WISE.W2", "WISE/WISE.W3", "WISE/WISE.W4",
+        
+        # --- NEXT-GEN SPACE: ROMAN ---
+        "Roman/WFI.F062", "Roman/WFI.F087", "Roman/WFI.F106", "Roman/WFI.F129", 
+        "Roman/WFI.F146", "Roman/WFI.F158", "Roman/WFI.F184",
+        
+        # --- ALL-SKY SURVEYS: 2MASS, SDSS, PAN-STARRS, GAIA, TESS ---
+        "2MASS/2MASS.J", "2MASS/2MASS.H", "2MASS/2MASS.Ks",
+        "SLOAN/SDSS.u", "SLOAN/SDSS.g", "SLOAN/SDSS.r", "SLOAN/SDSS.i", "SLOAN/SDSS.z",
+        "PAN-STARRS/PS1.g", "PAN-STARRS/PS1.r", "PAN-STARRS/PS1.i", "PAN-STARRS/PS1.z", "PAN-STARRS/PS1.y",
+        "GAIA/GAIA3.G", "GAIA/GAIA3.Gbp", "GAIA/GAIA3.Grp",
+        "TESS/TESS.Red", "Kepler/Kepler.K"
+    ]
+    
+    # Extract the raw ExoREM spectrum and ensure it is sorted
+    exo_wl = getattr(atm_out, 'wavelength', None)
+    exo_flux = getattr(atm_out, 'flux_flambda', None)
+    
+    photometry_section = {
+        'wavelength_um': exo_wl,
+        'emission_flux_W_m2_um': exo_flux,
+        'transit_depth': getattr(atm_out, 'transit_depth', None), 
+        'bands': {}
+    }
+    
+    if exo_wl is None or exo_flux is None:
+        logging.error("Missing raw spectral arrays; skipping photometry.")
+        return photometry_section
+        
+    valid = exo_wl > 0
+    exo_wl = exo_wl[valid]
+    exo_flux = exo_flux[valid]
+
+    sort_idx = np.argsort(exo_wl)
+    exo_wl = exo_wl[sort_idx]
+    exo_flux = exo_flux[sort_idx]
+
+    # Process all filters
+    for filter_id in target_filters:
+        try:
+            # --- CACHE CHECK ---
+            if filter_id not in _FILTER_CACHE:
+                # Only pings the SVO server if we have literally never seen this filter before!
+                _FILTER_CACHE[filter_id] = get_svo_filter(filter_id)
+                
+            filt_wav, filt_trans = _FILTER_CACHE[filter_id]
+            
+            # --- INTEGRATION MATH (Photon Counting by default) ---
+            interp_trans = np.interp(exo_wl, filt_wav, filt_trans, left=0.0, right=0.0)
+
+            if np.sum(interp_trans) == 0:
+                continue # Spectrum doesn't overlap with this filter, gracefully skip.
+
+            eff_wav = np.trapz(interp_trans * exo_wl, exo_wl) / np.trapz(interp_trans, exo_wl)
+
+            numerator = np.trapz(exo_flux * interp_trans * exo_wl, exo_wl)
+            denominator = np.trapz(interp_trans * exo_wl, exo_wl)
+
+            phot_flux_flambda = numerator / denominator
+
+            c_um_s = 299792458.0 * 1e6
+            phot_flux_fnu = phot_flux_flambda * (eff_wav**2) / c_um_s
+            phot_flux_jy = phot_flux_fnu * 1e26
+
+            photometry_section['bands'][filter_id] = {
+                "filter_id": filter_id,
+                "effective_wavelength_um": eff_wav,
+                "flux_W_m2_um": phot_flux_flambda,
+                "flux_Jy": phot_flux_jy
+            }
+            
+        except Exception as e:
+            # Fails silently and moves on to the next filter
+            pass
+
+    logging.info(f"✅ Successfully cached and computed {len(photometry_section['bands'])} photometric bands!")
+    return photometry_section

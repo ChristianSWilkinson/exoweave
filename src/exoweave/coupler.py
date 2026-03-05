@@ -1,9 +1,21 @@
+"""
+ExoWeave Coupler Module.
+
+Orchestrates the iterative coupling between exowrap (Atmosphere) and 
+fuzzycore (Interior) models. Uses a 1D secant root-finding method to adjust 
+surface gravity until the fully integrated atmospheric + interior mass 
+matches the target planetary mass.
+"""
+
 import logging
-import numpy as np
-from pathlib import Path
-from datetime import datetime
-import pickle
 import os
+import pickle
+import shutil
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
 
 # Resolve the absolute path to the exoweave project root
 EXOWEAVE_ROOT = Path(__file__).resolve().parents[2]
@@ -11,21 +23,35 @@ EXOWEAVE_ROOT = Path(__file__).resolve().parents[2]
 # External dependencies
 from exowrap.model import Simulation
 from exowrap.output import ExoremOut
+from exowrap.tools import upgrade_resolution
+from fuzzycore.constants import G_CONST, M_JUPITER, R_JUPITER
 from fuzzycore.solver import solve_structure
 from fuzzycore.utils import DummyLock, generate_gaussian_z_profile
-from fuzzycore.constants import G_CONST, M_JUPITER, R_JUPITER
 
 # Internal exoweave modules
+from .io import save_converged_model, save_failed_run, save_step_model
+from .physics import (
+    calculate_comprehensive_photometry,
+    calculate_new_tint,
+    calculate_stitched_mass,
+    calculate_z_base,
+)
 from .profile import build_master_profile
-from .physics import calculate_new_tint, calculate_z_base, calculate_stitched_mass
-from .io import save_step_model, save_converged_model, save_failed_run
+
 
 class ExoCoupler:
     """
-    Orchestrates the iterative coupling between exowrap (Atmosphere) 
-    and fuzzycore (Interior) models using pure 1D mass-targeting root-finding.
+    Orchestrates the iterative coupling between atmospheric and interior models.
     """
+
     def __init__(self, target_params: dict, config: dict):
+        """
+        Initializes the coupler with target parameters and grid configuration.
+
+        Args:
+            target_params (dict): Physical parameters for the target planet.
+            config (dict): Grid execution and convergence settings.
+        """
         self.params = target_params.copy()
         self.config = config
         
@@ -41,9 +67,8 @@ class ExoCoupler:
         self.tmp_dir = EXOWEAVE_ROOT / "tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.tmp_dir / f"solver_steps_{os.getpid()}.csv"
-        # ------------------------------
-
-        # Convergence Settings
+        
+        # --- Convergence Settings ---
         self.max_iterations = config.get("max_iterations", 15)
         self.mass_tol = config.get("mass_convergence_threshold", 0.01)
         self.p_link_bar = config.get("p_link_target_bar", 100.0)
@@ -58,38 +83,56 @@ class ExoCoupler:
         }
 
     def _guess_initial_gravity(self) -> float:
-        """Calculates a smart initial gravity guess based on a basic Mass-Radius empirical prior."""
+        """
+        Calculates a smart initial gravity guess based on an empirical 
+        Mass-Radius prior to speed up convergence.
+        
+        Returns:
+            float: Initial surface gravity guess in m/s^2.
+        """
         mass_kg = self.params['mass'] * M_JUPITER
         radius_guess = R_JUPITER 
+        
         if self.params['mass'] < 0.5:
             radius_guess = R_JUPITER * (self.params['mass'] ** 0.3)
             
         initial_g = (G_CONST * mass_kg) / (radius_guess ** 2)
-        logging.info(f"💡 Smart Initialization: Guessed g = {initial_g:.2f} m/s² for M = {self.params['mass']} M_Jup")
+        logging.info(
+            f"💡 Smart Initialization: Guessed g = {initial_g:.2f} m/s² "
+            f"for M = {self.params['mass']} M_Jup"
+        )
         return float(initial_g)
 
     def _extract_boundary_conditions(self, atm_out: ExoremOut) -> tuple:
         """
         Dynamically locates the junction point by identifying the thickest 
-        continuous convective block, gracefully ignoring numerical flickering.
+        continuous convective block in the atmosphere.
+        
+        Args:
+            atm_out (ExoremOut): The parsed atmospheric model output.
+            
+        Returns:
+            tuple: (Pressure in bar, Temperature in K) at the linking boundary.
         """
         p_levels_bar = atm_out.pressure_levels / 1e5
         t_levels = atm_out.temperature_levels
         
         try:
-            is_conv = np.asarray(atm_out._get('/outputs/levels/is_convective')).astype(bool)
+            is_conv_raw = atm_out._get('/outputs/levels/is_convective')
+            is_conv = np.asarray(is_conv_raw).astype(bool)
         except Exception as e:
-            logging.warning(f"Could not find convective flags ({e}). Falling back to static target.")
+            logging.warning(
+                f"Could not find convective flags ({e}). "
+                "Falling back to static target."
+            )
             idx_link = np.argmin(np.abs(p_levels_bar - self.p_link_bar))
             return float(p_levels_bar[idx_link]), float(t_levels[idx_link])
 
-        # 1. Sort top-to-bottom (Space to Deep Interior)
         sort_idx = np.argsort(p_levels_bar)
         p_sorted = p_levels_bar[sort_idx]
         t_sorted = t_levels[sort_idx]
         conv_sorted = is_conv[sort_idx]
         
-        # 2. Map out every contiguous block of convection in the atmosphere
         blocks = []
         in_block = False
         start_idx = 0
@@ -106,40 +149,43 @@ class ExoCoupler:
             blocks.append((start_idx, len(conv_sorted) - 1))
 
         if not blocks:
-            logging.warning("No convective regions found! Falling back to static target.")
+            logging.warning("No convective regions found! Fallback to static.")
             idx_link = np.argmin(np.abs(p_levels_bar - self.p_link_bar))
             return float(p_levels_bar[idx_link]), float(t_levels[idx_link])
 
-        # 3. Find the "Main Envelope" (The block with the largest log-pressure span)
         best_block = None
         max_span = -1.0
         
         for start, end in blocks:
-            # Measure how many decades of pressure this block covers
             span = np.log10(p_sorted[end] / p_sorted[start])
             if span > max_span:
                 max_span = span
                 best_block = (start, end)
 
-        # 4. Anchor exactly to the TOP of the main envelope block!
         top_idx = best_block[0]
         self.p_link_bar = float(p_sorted[top_idx])
         
-        logging.info(f"🔗 Dynamic Junction: Anchoring to thickest convective block at P = {self.p_link_bar:.2f} bar")
+        logging.info(
+            f"🔗 Dynamic Junction: Anchoring to thickest convective block "
+            f"at P = {self.p_link_bar:.2f} bar"
+        )
         return float(p_sorted[top_idx]), float(t_sorted[top_idx])
     
     def _find_closest_prior_profile(self, init_pt_file: Path) -> bool:
         """
         Scans the output directory for previously saved models to use as a 
-        warm-started prior, drastically reducing iteration time.
-        """
-        import pickle
+        warm-started prior, drastically reducing the initial iteration time.
         
+        Args:
+            init_pt_file (Path): Destination to write the prior P-T profile.
+            
+        Returns:
+            bool: True if a valid prior was found and written, False otherwise.
+        """
         best_file = None
         best_distance = float('inf')
-        threshold = 0.30  # Max 30% aggregate parameter difference allowed
+        threshold = 0.30  
         
-        # Scan all .pkl files in the output directory and subdirectories
         for pkl_path in self.output_dir.glob("**/*.pkl"):
             try:
                 with open(pkl_path, 'rb') as f:
@@ -150,7 +196,6 @@ class ExoCoupler:
                     
                 saved = data['parameters']
                 
-                # Calculate normalized Euclidean distance between parameters
                 m_diff = abs(saved.get('mass', 1.0) - self.params['mass']) / self.params['mass']
                 t_int_diff = abs(saved.get('T_int', 500) - self.params['T_int']) / max(self.params['T_int'], 1)
                 t_irr_diff = abs(saved.get('T_irr', 500) - self.params.get('T_irr', 500)) / max(self.params.get('T_irr', 500), 1)
@@ -167,26 +212,25 @@ class ExoCoupler:
                 continue
                 
         if best_file is not None:
-            logging.info(f"🧠 Smart Prior: Found neighbor model ({best_file.name}) with parameter distance {best_distance:.2f}")
+            logging.info(
+                f"🧠 Smart Prior: Found neighbor model ({best_file.name}) "
+                f"with parameter distance {best_distance:.2f}"
+            )
             df = best_data['profile']
             p_pa = df['Pressure_bar'].values * 1e5
             t_k = df['Temperature_K'].values
             
-            # SAFEGUARD: Fortran requires the file bounds to fully cover its internal grid.
-            # We must ensure the file goes from 0.1 Pa down to the target bottom pressure!
             target_p_bottom = self.p_bottom_bar * 1e5
             
             if p_pa[0] > 0.1:
                 p_pa = np.insert(p_pa, 0, 0.1)
-                t_k = np.insert(t_k, 0, t_k[0]) # Isothermal extension to space
+                t_k = np.insert(t_k, 0, t_k[0]) 
                 
             if p_pa[-1] < target_p_bottom:
                 p_pa = np.append(p_pa, target_p_bottom)
-                # Adiabatic extension to the deep interior
                 t_bottom = t_k[-1] * (target_p_bottom / p_pa[-2]) ** 0.286
                 t_k = np.append(t_k, t_bottom)
                 
-            # Downsample to ~200 points to keep the Fortran file clean and fast
             if len(p_pa) > 200:
                 idx = np.linspace(0, len(p_pa)-1, 200).astype(int)
                 p_pa = p_pa[idx]
@@ -204,8 +248,15 @@ class ExoCoupler:
         return False
 
     def run(self) -> dict:
+        """
+        Executes the main mass-matching solver loop to find a physically 
+        consistent atmosphere-interior structure.
+        
+        Returns:
+            dict: The final model data payload.
+        """
         # ==========================================
-        # 1. INITIALIZATION & DYNAMIC GRID SETUP
+        # 0. INITIALIZATION & DYNAMIC GRID SETUP
         # ==========================================
         self.params.setdefault('T_int', 500.0) 
         
@@ -217,14 +268,14 @@ class ExoCoupler:
         
         self.p_bottom_bar = self.config.get("p_bottom_bar", 1000.0)
         p_bottom_pa = self.p_bottom_bar * 1e5
-        self.params.setdefault('atmosphere_parameters', {})['pressure_max'] = p_bottom_pa
+        
+        if 'atmosphere_parameters' not in self.params:
+            self.params['atmosphere_parameters'] = {}
+        self.params['atmosphere_parameters']['pressure_max'] = p_bottom_pa
         
         init_pt_file = self.tmp_dir / "init_pt.dat"
-        
-        # --- NEW: Try the Smart Scanner First! ---
         smart_prior_success = self._find_closest_prior_profile(init_pt_file)
         
-        # --- Fallback: Mathematical Generator ---
         if not smart_prior_success:
             p_grid = np.logspace(-1, np.log10(p_bottom_pa), 81)
             t_irr = self.params.get('T_irr', 500.0)
@@ -246,28 +297,38 @@ class ExoCoupler:
                 header="pressure temperature\nPa K",
                 comments=""
             )
-            logging.info(f"🌌 Grid Setup: Generated mathematical cold-start prior down to {self.p_bottom_bar} bars.")
+            logging.info(
+                f"🌌 Grid Setup: Generated mathematical cold-start prior "
+                f"down to {self.p_bottom_bar} bars."
+            )
         
-        # Inject the chosen prior into the Fortran namelist
         path_str = str(self.tmp_dir)
         if not path_str.endswith('/'):
             path_str += '/'
             
-        self.params.setdefault('paths', {})['path_temperature_profile'] = path_str
-        self.params.setdefault('retrieval_parameters', {})['temperature_profile_file'] = init_pt_file.name
+        if 'paths' not in self.params:
+            self.params['paths'] = {}
+        self.params['paths']['path_temperature_profile'] = path_str
+        
+        if 'retrieval_parameters' not in self.params:
+            self.params['retrieval_parameters'] = {}
+        self.params['retrieval_parameters']['temperature_profile_file'] = init_pt_file.name
 
         # ==========================================
-        # 2. ITERATIVE LOOP
+        # ITERATIVE ROOT-FINDING LOOP
         # ==========================================
         for iteration in range(1, self.max_iterations + 1):
             current_g = self.params['g_1bar']
             static_t_int = self.params['T_int']
             
-            logging.info(f"\n{'='*40}")
-            logging.info(f"🔄 ITERATION {iteration}/{self.max_iterations} | Target Mass: {self.params['mass']} M_Jup | g: {current_g:.2f} m/s²")
-            logging.info(f"{'='*40}")
+            logging.info(f"\n{'='*50}")
+            logging.info(
+                f"🔄 ITERATION {iteration}/{self.max_iterations} | "
+                f"Target Mass: {self.params['mass']} M_Jup | g: {current_g:.2f} m/s²"
+            )
+            logging.info(f"{'='*50}")
             
-            # --- 0. WARM START INJECTION ---
+            # --- Warm Start Injection ---
             if iteration > 1 and atm_out is not None:
                 warm_start_file = self.tmp_dir / "warm_start_pt.dat"
                 p_pa = atm_out.pressure_levels
@@ -283,11 +344,13 @@ class ExoCoupler:
                 
                 self.params['paths']['path_temperature_profile'] = path_str
                 self.params['retrieval_parameters']['temperature_profile_file'] = warm_start_file.name
-                
                 logging.info(f"🔥 Warm Start: Injecting P-T profile from iteration {iteration - 1}")
 
-            # --- A. RUN ATMOSPHERE (exowrap) ---
-            atm_sim = Simulation(params=self.params, resolution=self.config.get('resolution', 50))
+            # --- A. RUN ATMOSPHERE (EXOWRAP) ---
+            atm_sim = Simulation(
+                params=self.params, 
+                resolution=self.config.get('resolution', 50)
+            )
             raw_atm_df = atm_sim.run()
             
             if raw_atm_df.empty:
@@ -297,9 +360,8 @@ class ExoCoupler:
             atm_out = ExoremOut(raw_atm_df)
             p_link, t_link = self._extract_boundary_conditions(atm_out)
             
-            # --- B. ENVELOPE COMPOSITION (Z-Profile & Y-Ratio) ---
+            # --- B. ENVELOPE COMPOSITION (Z-PROFILE) ---
             sigma_val = self.params.get('sigma_val', 0.0) 
-            
             z_base, y_ratio = calculate_z_base(
                 atm_out=atm_out, 
                 p_link_bar=self.p_link_bar, 
@@ -316,14 +378,14 @@ class ExoCoupler:
                 z_core=0.99
             ), 3)
 
-            # --- C. RUN INTERIOR (fuzzycore) ---
+            # --- C. RUN INTERIOR (FUZZYCORE) ---
             fc_params = {
                 'P_surf': p_link,
                 'T_surf': t_link,
                 'M_core': self.params.get('core_mass_earth', 10.0) * 5.972e24, 
                 'iron_fraction': self.params.get('iron_fraction', 0.33),
                 'z_base': z_base,
-                'Y_ratio': y_ratio,                          # Passed cleanly to solver
+                'Y_ratio': y_ratio,                          
                 'sigma_val': sigma_val,
                 'z_profile': z_profile,
                 'initial_log_pc': 12.5,                      
@@ -341,15 +403,17 @@ class ExoCoupler:
             
             if int_results is None:
                 logging.error("❌ fuzzycore solver failed to converge on an internal structure.")
-                return {'status': 'failed', 'history': self.history, 'atmosphere_raw': raw_atm_df}
+                return {
+                    'status': 'failed', 
+                    'history': self.history, 
+                    'atmosphere_raw': raw_atm_df
+                }
             
-            # --- D. CALCULATE STATE ERRORS ---
-            # 1. Calculate the precise total mass using spherical atmospheric integration
+            # --- D. CALCULATE STATE ERRORS & MASS ---
             new_mass_kg, interior_mass_kg, m_atm_kg = calculate_stitched_mass(
                 atm_out, int_results, self.p_link_bar
             )
             
-            # 2. Calculate the state errors
             mass_error = (new_mass_kg - target_mass_kg) / target_mass_kg
             true_t_int = calculate_new_tint(atm_out, fallback_t_int=static_t_int)
             
@@ -359,22 +423,48 @@ class ExoCoupler:
             self.history['g_1bar'].append(current_g)
             self.history['mass_calculated'].append(new_mass_kg / M_JUPITER)
             
-            # 3. Log the results
             logging.info(f"📊 Breakdown: Interior Mass = {interior_mass_kg / M_JUPITER:.4f} M_Jup")
             logging.info(f"📊 Breakdown: Atm Mass = {m_atm_kg / M_JUPITER:.6f} M_Jup ({m_atm_kg/new_mass_kg:.3%} of total)")
             logging.info(f"📊 Results: Total Calc Mass = {new_mass_kg / M_JUPITER:.3f} M_Jup (Error: {mass_error:.2%})")
             logging.info(f"📊 Results: True Measured T_int = {true_t_int:.1f} K (Input dial: {static_t_int} K)")
 
-            # --- E. STITCH AND SAVE CURRENT STEP ---
-            step_profile = build_master_profile(atm_out, int_results, p_link)
-            
-            # Log the true physics into the parameters specifically for the saved output
+            # --- E. HIGH-RES UPGRADE, PHOTOMETRY & STITCHING ---
             output_params = self.params.copy()
             output_params['T_int_input_dial'] = static_t_int
             output_params['T_int'] = true_t_int 
-            
-            # ADD THIS LINE: Save the dynamic linking pressure!
+            output_params['true_mass_Mjup'] = new_mass_kg / M_JUPITER
             output_params['p_link_bar'] = self.p_link_bar
+            
+            target_res = self.config.get('target_resolution', None)
+            current_res = self.config.get('resolution', 50)
+            
+            if target_res and target_res > current_res:
+                logging.info(f"✨ Upgrading atmosphere to R={target_res} for iteration {iteration}...")
+                
+                unique_hash = uuid.uuid4().hex[:8]
+                unique_tmp_dir = self.output_dir / f"high_res_tmp_{unique_hash}"
+                
+                try:
+                    raw_atm_df_high_res = upgrade_resolution(
+                        results=atm_out,
+                        base_params=output_params,
+                        target_resolution=target_res,
+                        output_dir=str(unique_tmp_dir)
+                    )
+                    
+                    atm_out = ExoremOut(raw_atm_df_high_res)
+                    raw_atm_df = raw_atm_df_high_res  
+                    logging.info("🌟 High-resolution upgrade seamlessly injected!")
+                    
+                except Exception as e:
+                    logging.error(f"⚠️ High-resolution upgrade failed ({e}). Keeping low-res model.")
+                    
+                finally:
+                    if unique_tmp_dir.exists():
+                        shutil.rmtree(unique_tmp_dir, ignore_errors=True)
+
+            step_profile = build_master_profile(atm_out, int_results, p_link)
+            photometry_section = calculate_comprehensive_photometry(atm_out)
 
             step_data = {
                 'status': 'intermediate',
@@ -385,32 +475,33 @@ class ExoCoupler:
                 'mass_error': mass_error,
                 'profile': step_profile,
                 'atmosphere_raw': raw_atm_df,
-                'interior_raw': int_results
+                'interior_raw': int_results,
+                'photometry': photometry_section
             }
             save_step_model(step_data, self.output_dir)
             
-            # --- F. CHECK CONVERGENCE ---
+            # --- F. CHECK CONVERGENCE & SAVE FINAL ---
             if abs(mass_error) < self.mass_tol:
                 logging.info(f"✅ CONVERGED in {iteration} iterations!")
                 
                 converged_results = {
                     'status': 'converged',
                     'iterations': iteration,
-                    'final_params': output_params, # Contains the swapped T_int!
+                    'final_params': output_params,
                     'stitched_profile': step_profile, 
-                    'atmosphere_raw': raw_atm_df,
-                    'interior_raw': int_results
+                    'atmosphere_raw': raw_atm_df,  
+                    'interior_raw': int_results,
+                    'photometry': photometry_section
                 }
                 
                 save_converged_model(converged_results, self.output_dir)
                 return converged_results
-                
-            # --- G. SECANT METHOD UPDATES ---
-            # NOTE: T_int is NOT updated. It remains completely static for stability!
+            
+            # --- G. SECANT METHOD UPDATES (GRAVITY ADJUSTMENT) ---
             if iteration == 1:
                 correction = max(min(mass_error, 0.05), -0.05) 
                 next_g = current_g * (1.0 + correction)
-                logging.info(f"📈 Secant Prep: Nudging gravity to establish mass gradient.")
+                logging.info("📈 Secant Prep: Nudging gravity to establish mass gradient.")
             else:
                 g_n = current_g
                 g_n_minus_1 = self.history['g_1bar'][-2]
@@ -428,7 +519,13 @@ class ExoCoupler:
 
             self.params['g_1bar'] = next_g
 
-        logging.warning(f"❌ Reached maximum iterations ({self.max_iterations}) without convergence.")
+        # ==========================================
+        # FAILURE HANDLING
+        # ==========================================
+        logging.warning(
+            f"❌ Reached maximum iterations ({self.max_iterations}) "
+            "without convergence."
+        )
         
         fail_results = {
             'status': 'failed', 
@@ -436,5 +533,10 @@ class ExoCoupler:
             'atmosphere_raw': getattr(atm_out, 'df', None)  
         }
         
-        save_failed_run(self.history, self.params, "Max iterations reached without convergence.", self.output_dir)
+        save_failed_run(
+            self.history, 
+            self.params, 
+            "Max iterations reached without convergence.", 
+            self.output_dir
+        )
         return fail_results
