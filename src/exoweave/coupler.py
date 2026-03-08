@@ -71,8 +71,9 @@ class ExoCoupler:
         # --- Convergence Settings ---
         self.max_iterations = config.get("max_iterations", 15)
         self.mass_tol = config.get("mass_convergence_threshold", 0.01)
-        self.p_link_bar = config.get("p_link_target_bar", 100.0)
         self.p_bottom_bar = config.get("p_bottom_bar", 1000.0) 
+        self.p_link_bar = config.get("p_link_target_bar", self.p_bottom_bar)
+        self.min_p_link_bar = config.get("min_p_link_bar", 0.1)
         
         self.history = {
             'iteration': [], 
@@ -102,6 +103,79 @@ class ExoCoupler:
             f"for M = {self.params['mass']} M_Jup"
         )
         return float(initial_g)
+    
+    def _bootstrap_gravity(self) -> float:
+        """
+        Runs a rapid, 1-bar interior solve using a fully convective (Sharp Core) 
+        assumption to guarantee a physically stable initial gravity guess.
+        """
+        logging.info("👢 Bootstrapping initial gravity via 1-bar interior pre-solve...")
+        
+        target_mass_kg = self.params['mass'] * M_JUPITER
+        
+        # --- 1. USER'S FIX: INTEGRATE DIRECTLY TO 1 BAR ---
+        p_surf_pa = 1e5  # Exactly 1 bar
+        t_surf = max(self.params.get('T_irr', 500.0) * 0.7, self.params.get('T_int', 500.0))
+        
+        # --- 2. BULLETPROOF PHYSICS ---
+        # We force sigma=0.0 (Sharp Core) for the dry-run ONLY. 
+        # This bypasses the multi-layer KD-Tree stepper, guaranteeing the 
+        # root-finder will converge in milliseconds without hanging on phase transitions.
+        from fuzzycore.utils import generate_gaussian_z_profile
+        z_profile = generate_gaussian_z_profile(
+            n_layers=1, 
+            sigma=0.0, 
+            z_base=0.02, 
+            z_core=0.02
+        )
+        
+        # Dynamic starting guess for the root-finder
+        mass_mj = self.params['mass']
+        if mass_mj < 0.1: log_pc_guess = 10.0
+        elif mass_mj < 0.5: log_pc_guess = 11.0
+        elif mass_mj <= 2.0: log_pc_guess = 12.5
+        else: log_pc_guess = 13.5
+
+        fc_params = {
+            'P_surf': p_surf_pa,
+            'T_surf': t_surf,
+            'M_core': self.params.get('core_mass_earth', 10.0) * 5.972e24, 
+            'iron_fraction': self.params.get('iron_fraction', 0.33),
+            'z_base': 0.02,  
+            'Y_ratio': 0.26,                          
+            'sigma_val': 0.0,  # <--- Forced Sharp Core
+            'z_profile': z_profile,
+            'initial_log_pc': log_pc_guess,                      
+            'debug': False     
+        }
+        
+        # --- 3. SOLVE ---
+        from fuzzycore.solver import solve_structure
+        from fuzzycore.utils import DummyLock
+        import os
+        
+        int_results = solve_structure(
+            target_val=target_mass_kg,
+            params=fc_params,
+            mode='mass',                              
+            trial_id="bootstrap",
+            csv_file=os.devnull,
+            write_lock=DummyLock()
+        )
+        
+        if int_results is None:
+            logging.warning("⚠️ Bootstrap interior failed. Falling back to empirical guess.")
+            return self._guess_initial_gravity()
+            
+        # --- 4. EXACT 1-BAR GRAVITY ---
+        # Because we integrated to 1 bar, the final radius is exactly R_1bar!
+        r_1bar_m = int_results['R'][-1]
+        interior_mass_kg = int_results['M'][-1]
+        
+        calc_g = (G_CONST * interior_mass_kg) / (r_1bar_m ** 2)
+        
+        logging.info(f"✅ Bootstrap successfully locked initial g_1bar = {calc_g:.2f} m/s²")
+        return float(calc_g)
 
     def _extract_boundary_conditions(self, atm_out: ExoremOut) -> tuple:
         """
@@ -163,6 +237,21 @@ class ExoCoupler:
                 best_block = (start, end)
 
         top_idx = best_block[0]
+        candidate_p = float(p_sorted[top_idx])
+        
+        if candidate_p < self.min_p_link_bar:
+            logging.info(
+                f"🛡️ Convective top at {candidate_p:.3e} bar is too shallow. "
+                f"Clamping to >= {self.min_p_link_bar} bar."
+            )
+            # p_sorted is ascending, so we find the first index >= our minimum
+            valid_indices = np.where(p_sorted >= self.min_p_link_bar)[0]
+            if len(valid_indices) > 0:
+                top_idx = valid_indices[0]
+            else:
+                # Fallback if the whole atmosphere is somehow extremely low pressure
+                top_idx = len(p_sorted) - 1
+
         self.p_link_bar = float(p_sorted[top_idx])
         
         logging.info(
@@ -261,7 +350,15 @@ class ExoCoupler:
         self.params.setdefault('T_int', 500.0) 
         
         if 'g_1bar' not in self.params:
-            self.params['g_1bar'] = self._guess_initial_gravity()
+            # First try to find a smart prior from previous runs
+            smart_prior_success = self._find_closest_prior_profile(self.tmp_dir / "init_pt.dat")
+            
+            if smart_prior_success:
+                # If we have a nearly identical prior, the old guess is perfectly safe
+                self.params['g_1bar'] = self._guess_initial_gravity()
+            else:
+                # If this is a cold start, run the interior pre-conditioner to protect ExoREM!
+                self.params['g_1bar'] = self._bootstrap_gravity()
         
         target_mass_kg = self.params['mass'] * M_JUPITER
         atm_out = None 
