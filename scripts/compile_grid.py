@@ -11,9 +11,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 def compile_exoweave_grid(input_dir: str, output_prefix: str):
     """
-    Scans a directory of ExoWeave .pkl outputs and compiles them into a 
-    searchable CSV catalog and a highly compressed HDF5 binary data store.
-    Supports resuming interrupted runs or appending new files to an existing grid.
+    Scans a directory of ExoWeave .pkl outputs and compiles them into:
+      1. A searchable CSV catalog (_catalog.csv)
+      2. A highly compressed master HDF5 binary data store (_data.h5)
+      3. A lightweight CoolTrack-specific HDF5 extract (_cooltrack.h5)
     """
     in_path = Path(input_dir)
     if not in_path.exists():
@@ -22,6 +23,7 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
 
     csv_path = Path(f"{output_prefix}_catalog.csv")
     h5_path = Path(f"{output_prefix}_data.h5")
+    cooltrack_path = Path(f"{output_prefix}_cooltrack.h5") # <-- NEW: Cooltrack output
     
     pkl_files = list(in_path.glob("**/*.pkl"))
     # Sort files to ensure consistent ordering across runs
@@ -31,7 +33,7 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
         logging.error("No .pkl files found to compile.")
         return
 
-    # --- NEW: Check for Existing Progress to Resume ---
+    # --- Check for Existing Progress to Resume ---
     processed_files = set()
     existing_catalog = []
     next_model_idx = 0
@@ -69,8 +71,8 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
     summary_catalog = existing_catalog.copy()
     R_JUPITER_M = 71492000.0
 
-    # --- FIX: Open HDF5 in 'a' (append) mode instead of 'w' (write) ---
-    with h5py.File(h5_path, 'a') as h5f:
+    # --- Open both Master and Cooltrack HDF5 files in append mode ---
+    with h5py.File(h5_path, 'a') as h5f, h5py.File(cooltrack_path, 'a') as ct_h5:
         
         for idx, pkl_file in enumerate(files_to_process):
             model_id = f"model_{next_model_idx:05d}"
@@ -119,8 +121,6 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
             prof_df = data.get('profile') if 'profile' in data else data.get('stitched_profile')
             atm_df = data.get('atmosphere_raw')
             int_raw = data.get('interior_raw', {})
-            
-            # Extract the new photometry dictionary!
             phot_data = data.get('photometry', {})
             
             if status in ['target_reached', 'max_iterations_reached'] and prof_df is not None and not prof_df.empty:
@@ -145,14 +145,11 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                         catalog_entry[f"{safe_name}_flux_Wm2um"] = metrics.get('flux_W_m2_um', np.nan)
                         catalog_entry[f"{safe_name}_flux_Jy"] = metrics.get('flux_Jy', np.nan)
 
-            # --- 4. Populate the 5-Folder HDF5 Structure ---
-            # If the model group somehow exists, delete it first to avoid crashes
+            # --- 4. Populate the Master HDF5 Structure ---
             if model_id in h5f:
                 del h5f[model_id]
-                
             model_grp = h5f.create_group(model_id)
 
-            # Folder 1: Parameters
             param_grp = model_grp.create_group('parameters')
             for k, v in params.items():
                 if isinstance(v, (str, bytes, int, float, bool, np.number)):
@@ -160,13 +157,13 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
 
             if status in ['target_reached', 'max_iterations_reached']:
                 
-                # Folder 2: Stitched Profile
+                # Master: Stitched Profile
                 if prof_df is not None and not prof_df.empty:
                     prof_grp = model_grp.create_group('stitched_profile')
                     for col in prof_df.columns:
                         prof_grp.create_dataset(col, data=prof_df[col].values, compression="gzip")
 
-                # Folder 3: Atmosphere Raw
+                # Master: Atmosphere Raw
                 if atm_df is not None and not atm_df.empty:
                     atm_grp = model_grp.create_group('atmosphere_raw')
                     for col in atm_df.columns:
@@ -180,7 +177,7 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                             except Exception:
                                 pass
 
-                # Folder 4: Interior Raw
+                # Master: Interior Raw
                 if int_raw:
                     int_grp = model_grp.create_group('interior_raw')
                     for k, v in int_raw.items():
@@ -192,10 +189,9 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                             except Exception:
                                 pass
                                 
-                # --- NEW FOLDER 5: Photometry ---
+                # Master: Photometry
                 if phot_data:
                     phot_grp = model_grp.create_group('photometry')
-                    
                     for arr_key in ['wavelength_um', 'emission_flux_W_m2_um', 'transit_depth']:
                         arr_val = phot_data.get(arr_key)
                         if arr_val is not None:
@@ -214,12 +210,47 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                                 if isinstance(m_val, (int, float, str, bool, np.number)):
                                     f_grp.attrs[m_name] = m_val
 
+                # =================================================================
+                # 5. Populate the COOLTRACK Minimal HDF5 Extract
+                # =================================================================
+                if model_id in ct_h5:
+                    del ct_h5[model_id]
+                ct_grp = ct_h5.create_group(model_id)
+                
+                # Cooltrack: Basic independent dimensions
+                ct_param_grp = ct_grp.create_group('parameters')
+                essential_params = ['mass', 'true_mass_Mjup', 'T_int', 'T_int_input_dial', 
+                                    'T_irr', 'Met', 'core_mass_earth', 'f_sed', 'kzz']
+                for k in essential_params:
+                    if k in params:
+                        ct_param_grp.attrs[k] = params[k]
+                
+                # Cooltrack: Extract only radius, cooling rate, and entropy curve
+                ct_int_grp = ct_grp.create_group('interior_raw')
+                if int_raw:
+                    for attr_key in ['R_total', 'dt_ds_total']:
+                        if attr_key in int_raw:
+                            ct_int_grp.attrs[attr_key] = int_raw[attr_key]
+                    if 'S' in int_raw:
+                        ct_int_grp.create_dataset('S', data=np.asarray(int_raw['S']), compression="gzip")
+                
+                # Cooltrack: Strip out raw spectra, keep only the target band fluxes
+                if phot_data and 'bands' in phot_data:
+                    ct_phot_grp = ct_grp.create_group('photometry')
+                    ct_bands_grp = ct_phot_grp.create_group('bands')
+                    for filt_id, metrics in phot_data['bands'].items():
+                        safe_filt_id = filt_id.replace('/', '_')
+                        f_grp = ct_bands_grp.create_group(safe_filt_id)
+                        if 'flux_W_m2_um' in metrics:
+                            f_grp.attrs['flux_W_m2_um'] = metrics['flux_W_m2_um']
+                # =================================================================
+
             summary_catalog.append(catalog_entry)
             
             if (idx + 1) % 50 == 0:
                 logging.info(f"Processed {idx + 1}/{total_files} files...")
 
-    # --- 5. Save the Catalog ---
+    # --- 6. Save the Catalog ---
     df_catalog = pd.DataFrame(summary_catalog)
     
     # Reorder columns to keep the basics at the front
@@ -232,7 +263,8 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
     
     logging.info(f"✅ Grid Compilation Complete!")
     logging.info(f"📊 Catalog saved to: {csv_path}")
-    logging.info(f"🗄️  Data stored in:  {h5_path}")
+    logging.info(f"🗄️  Master Data stored in:  {h5_path}")
+    logging.info(f"⚡ CoolTrack Data stored in: {cooltrack_path}")
 
 if __name__ == "__main__":
     TARGET_GRID_DIR = "../outputs/grid_run"

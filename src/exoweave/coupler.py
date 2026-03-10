@@ -113,47 +113,40 @@ class ExoCoupler:
         
         target_mass_kg = self.params['mass'] * M_JUPITER
         
-        # --- 1. USER'S FIX: INTEGRATE DIRECTLY TO 1 BAR ---
-        p_surf_pa = 1e5  # Exactly 1 bar
+        # --- 1. INTEGRATE DIRECTLY TO 1 BAR ---
+        p_surf_pa = 1.0  # Exactly 1 bar
         t_surf = max(self.params.get('T_irr', 500.0) * 0.7, self.params.get('T_int', 500.0))
+        met_dial = self.params.get('Met', 0.0)
+        z_guess = min(0.015 * (10 ** met_dial), 0.95)
         
-        # --- 2. BULLETPROOF PHYSICS ---
-        # We force sigma=0.0 (Sharp Core) for the dry-run ONLY. 
-        # This bypasses the multi-layer KD-Tree stepper, guaranteeing the 
-        # root-finder will converge in milliseconds without hanging on phase transitions.
-        from fuzzycore.utils import generate_gaussian_z_profile
         z_profile = generate_gaussian_z_profile(
             n_layers=1, 
             sigma=0.0, 
-            z_base=0.02, 
-            z_core=0.02
+            z_base=z_guess, 
+            z_core=z_guess
         )
         
         # Dynamic starting guess for the root-finder
         mass_mj = self.params['mass']
-        if mass_mj < 0.1: log_pc_guess = 10.0
-        elif mass_mj < 0.5: log_pc_guess = 11.0
-        elif mass_mj <= 2.0: log_pc_guess = 12.5
-        else: log_pc_guess = 13.5
+        if mass_mj < 0.1: log_pc_guess = 8.0
+        elif mass_mj < 0.5: log_pc_guess = 9.0
+        elif mass_mj <= 2.0: log_pc_guess = 10.0
+        else: log_pc_guess = 11.0
 
         fc_params = {
             'P_surf': p_surf_pa,
             'T_surf': t_surf,
             'M_core': self.params.get('core_mass_earth', 10.0) * 5.972e24, 
             'iron_fraction': self.params.get('iron_fraction', 0.33),
-            'z_base': 0.02,  
+            'z_base': z_guess,                        # <--- NOW DYNAMIC
             'Y_ratio': 0.26,                          
-            'sigma_val': 0.0,  # <--- Forced Sharp Core
-            'z_profile': z_profile,
+            'sigma_val': 0.0,  
+            'z_profile': z_profile,                   # <--- NOW DYNAMIC
             'initial_log_pc': log_pc_guess,                      
-            'debug': False     
+            'debug': self.params.get('debug', False)    
         }
         
-        # --- 3. SOLVE ---
-        from fuzzycore.solver import solve_structure
-        from fuzzycore.utils import DummyLock
-        import os
-        
+        # --- 3. SOLVE ---        
         int_results = solve_structure(
             target_val=target_mass_kg,
             params=fc_params,
@@ -173,6 +166,11 @@ class ExoCoupler:
         interior_mass_kg = int_results['M'][-1]
         
         calc_g = (G_CONST * interior_mass_kg) / (r_1bar_m ** 2)
+        
+        # --- NEW: BOOTSTRAP CLAMP ---
+        if calc_g < 1.5:
+            logging.warning(f"⚠️ Bootstrap yielded dangerously low g = {calc_g:.2f} m/s²! Clamping to 1.0 m/s².")
+            calc_g = 1.5
         
         logging.info(f"✅ Bootstrap successfully locked initial g_1bar = {calc_g:.2f} m/s²")
         return float(calc_g)
@@ -485,7 +483,7 @@ class ExoCoupler:
                 'Y_ratio': y_ratio,                          
                 'sigma_val': sigma_val,
                 'z_profile': z_profile,
-                'initial_log_pc': 12.5,                      
+                'initial_log_pc': 9.0,                      
                 'debug': self.params.get('debug', False)     
             }
             
@@ -612,7 +610,16 @@ class ExoCoupler:
                     next_g = g_n - e_n * ((g_n - g_n_minus_1) / (e_n - e_n_minus_1))
                     logging.info("🎯 Secant Method applied to Mass target.")
                     
+                # Relative dampening to prevent wild percentage swings
                 next_g = max(min(next_g, g_n * 1.5), g_n * 0.5) 
+
+            # --- NEW: ABSOLUTE PHYSICAL FLOOR ---
+            # Protect ExoREM's Fortran backend from dividing by zero or 
+            # exploding the atmospheric scale height on runaway secant extrapolations.
+            if next_g < 1.5:
+                logging.warning(f"⚠️ Secant solver requested dangerously low g = {next_g:.3f} m/s²!")
+                logging.warning("   Clamping to absolute minimum of 1.0 m/s² to protect ExoREM.")
+                next_g = 1.5
 
             self.params['g_1bar'] = next_g
 

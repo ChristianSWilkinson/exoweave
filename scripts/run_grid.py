@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # If you want a parameter to remain static (like T_irr), just set min and max to the same value.
 
 PARAM_BOUNDS = {
-    "mass": (0.1, 13.0),             # Jupiter Masses
+    "mass": (0.05, 13.0),             # Jupiter Masses
     "T_int": (200.0, 1500.0),        # Internal Temperatures (K)
     "T_irr": (100.0, 1500.0),       # Irradiation (K) - Static example
     "Met": (-2, 2),                 # Metallicity (log10 Z/Z_solar)
