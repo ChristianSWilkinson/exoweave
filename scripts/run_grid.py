@@ -20,8 +20,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 PARAM_BOUNDS = {
     "mass": (0.05, 13.0),             # Jupiter Masses
-    "T_int": (200.0, 1500.0),        # Internal Temperatures (K)
-    "T_irr": (100.0, 1500.0),       # Irradiation (K) - Static example
+    "T_int": (1000.0, 1600.0),        # Internal Temperatures (K)
+    "T_irr": (0.0, 1500.0),       # Irradiation (K) - Static example
     "Met": (-2, 2),                 # Metallicity (log10 Z/Z_solar)
     "core_mass_earth": (1, 100),    # Solid core mass in Earth masses
     "f_sed": (1.0, 7.0),            # Cloud sedimentation

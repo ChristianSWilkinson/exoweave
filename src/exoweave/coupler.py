@@ -27,6 +27,7 @@ from exowrap.tools import upgrade_resolution
 from fuzzycore.constants import G_CONST, M_JUPITER, R_JUPITER
 from fuzzycore.solver import solve_structure
 from fuzzycore.utils import DummyLock, generate_gaussian_z_profile
+import fuzzycore.constants as c
 
 # Internal exoweave modules
 from .io import save_converged_model, save_failed_run, save_step_model
@@ -126,17 +127,19 @@ class ExoCoupler:
             z_core=z_guess
         )
         
-        # Dynamic starting guess for the root-finder
+        # Dynamic starting guess to prevent Gas Giant roots for Sub-Neptunes
         mass_mj = self.params['mass']
-        if mass_mj < 0.1: log_pc_guess = 8.0
-        elif mass_mj < 0.5: log_pc_guess = 9.0
-        elif mass_mj <= 2.0: log_pc_guess = 10.0
-        else: log_pc_guess = 11.0
+        if mass_mj < 0.05: log_pc_guess = 6.8  # < 15 Earth masses
+        elif mass_mj < 0.1: log_pc_guess = 7.5 # 15 - 30 Earth masses
+        elif mass_mj < 0.5: log_pc_guess = 8.5 # Saturns
+        elif mass_mj <= 2.0: log_pc_guess = 9.5 # Jupiters
+        else: log_pc_guess = 10.5 # Super-Jupiters
 
         fc_params = {
             'P_surf': p_surf_pa,
             'T_surf': t_surf,
-            'M_core': self.params.get('core_mass_earth', 10.0) * 5.972e24, 
+            'M_core': self.params.get('core_mass_earth', 10.0) * c.M_EARTH, 
+            'M_water':  self.params.get('M_water', 0.0) * c.M_EARTH, 
             'iron_fraction': self.params.get('iron_fraction', 0.33),
             'z_base': z_guess,                        # <--- NOW DYNAMIC
             'Y_ratio': 0.26,                          
@@ -145,6 +148,8 @@ class ExoCoupler:
             'initial_log_pc': log_pc_guess,                      
             'debug': self.params.get('debug', False)    
         }
+
+
         
         # --- 3. SOLVE ---        
         int_results = solve_structure(
@@ -477,7 +482,8 @@ class ExoCoupler:
             fc_params = {
                 'P_surf': p_link,
                 'T_surf': t_link,
-                'M_core': self.params.get('core_mass_earth', 10.0) * 5.972e24, 
+                'M_core': self.params.get('core_mass_earth', 10.0) * c.M_EARTH, 
+                'M_water':  self.params.get('M_water', 0.0) * c.M_EARTH,
                 'iron_fraction': self.params.get('iron_fraction', 0.33),
                 'z_base': z_base,
                 'Y_ratio': y_ratio,                          

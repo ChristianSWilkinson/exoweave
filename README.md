@@ -23,16 +23,38 @@ ExoWeave is designed to manage its own complex dependencies.
 Clone this repository and install it in editable mode:
 ```bash
 git clone git@github.com:ChristianSWilkinson/exoweave.git
+```
+or :
+```bash
+git clone https://github.com/ChristianSWilkinson/exoweave.git
+```
+```bash
 cd exoweave
 pip install -e .
 ```
 
-**2. Bootstrap the Ecosystem**
+**2. The Compiler & HDF5 (The Conda Route - Recommended)**
+If you are using Anaconda/Miniconda, the native HDF5 wrappers (`h5fc`) are incredibly strict about which compiler they use. **You must install Conda's Fortran compiler**.
+
+*For Linux, Windows, or Intel Macs:*
+```bash
+conda create -n exowrap_env -c conda-forge fortran-compiler hdf5 python=3.10
+
+conda activate exowrap_env
+```
+
+**3. Bootstrap the Ecosystem**
 Run the built-in initialization command. This will create a hidden `~/.exolinker/src/` folder, download `exowrap` and `fuzzycore`, install them, and compile the heavy Fortran backends automatically.
 ```bash
 exoweave init
 ```
 *(Note: If the dependencies are already installed, this command will present a clean interactive menu asking if you want to update, re-clone, or skip).*
+
+**4. Download High-Resolution Tables (Optional)**
+If you want to run high-resolution models (R=500 or R=20000), download the corresponding K-tables:
+```bash
+exowrap download-tables --res 500
+```
 
 ---
 
