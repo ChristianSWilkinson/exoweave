@@ -19,7 +19,17 @@ By leveraging advanced numerical root-finding (the Secant Method) and smart empi
 
 ExoWeave is designed to manage its own complex dependencies. 
 
-**1. Install the Orchestrator**
+**1. The Compiler & HDF5 (The Conda Route - Recommended)**
+If you are using Anaconda/Miniconda, the native HDF5 wrappers (`h5fc`) are incredibly strict about which compiler they use. **You must install Conda's Fortran compiler**.
+
+*For Linux, Windows, or Intel Macs:*
+```bash
+conda create -n exoweave_env -c conda-forge fortran-compiler hdf5 python=3.10
+
+conda activate exoweave
+```
+
+**2. Install the Orchestrator**
 Clone this repository and install it in editable mode:
 ```bash
 git clone git@github.com:ChristianSWilkinson/exoweave.git
@@ -31,16 +41,6 @@ git clone https://github.com/ChristianSWilkinson/exoweave.git
 ```bash
 cd exoweave
 pip install -e .
-```
-
-**2. The Compiler & HDF5 (The Conda Route - Recommended)**
-If you are using Anaconda/Miniconda, the native HDF5 wrappers (`h5fc`) are incredibly strict about which compiler they use. **You must install Conda's Fortran compiler**.
-
-*For Linux, Windows, or Intel Macs:*
-```bash
-conda create -n exowrap_env -c conda-forge fortran-compiler hdf5 python=3.10
-
-conda activate exowrap_env
 ```
 
 **3. Bootstrap the Ecosystem**
