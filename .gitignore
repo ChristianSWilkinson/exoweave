@@ -21,6 +21,7 @@ env/
 data/
 exoweave_outputs/
 tmp/
+outputs/
 
 # ExoWeave / FuzzyCore specific outputs
 results/
@@ -30,6 +31,7 @@ test_run.csv
 *.h5
 *.nml
 *.pkl
+*.pdf
 
 # Readme generator
 generate_readme.py

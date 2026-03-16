@@ -13,45 +13,178 @@ import numpy as np
 import pandas as pd
 
 class ExoFilter:
-    """Detects physical unreliability in ExoWeave model outputs."""
+    """Quality Control filter using exact ExoWeave .pkl and HDF5 keys."""
     
     @staticmethod
-    def check_pt_continuity(prof_df, threshold_k=500):
-        """Detects massive temperature jumps at the stitching boundary."""
-        if prof_df is None or prof_df.empty: return False
-        # Calculate the absolute difference between adjacent temperature points
-        t_diff = np.abs(np.diff(prof_df['Temperature_K'].values))
-        return np.max(t_diff) < threshold_k
+    def check_pt_continuity(prof_df, catalog_entry, min_jump_k=150, grad_threshold=5000):
+        """
+        Intelligently detects bad stitching in the envelope by evaluating the 
+        thermodynamic gradient, while explicitly ignoring the degenerate core.
+        """
+        if prof_df is None or prof_df.empty: 
+            return False, "NO_PROFILE_DATA"
+            
+        if 'Temperature_K' not in prof_df.columns or 'Pressure_Pa' not in prof_df.columns:
+            return False, "MISSING_COLUMNS"
+            
+        # 1. Anchor the search to the stitch point. Default to 1000 bar if missing.
+        p_link_bar = catalog_entry.get('P_link_bar', 1000.0)
+        if np.isnan(p_link_bar): 
+            p_link_bar = 1000.0
+            
+        # 2. Define the safe zone: Check the atmosphere and the upper envelope.
+        # Stopping 1,000x below the link pressure ensures we check the stitch 
+        # but stop well before the core boundary (which is usually > 10 Mbar).
+        max_valid_pressure_pa = p_link_bar * 1e5 * 1000.0
+        
+        mask = prof_df['Pressure_Pa'].values < max_valid_pressure_pa
+        
+        t_values = prof_df.loc[mask, 'Temperature_K'].values
+        p_values = prof_df.loc[mask, 'Pressure_Pa'].values
+        
+        if len(t_values) < 2:
+            return True, "OK" # Fallback if mask removes everything
+            
+        # 3. Calculate layer-to-layer differences
+        dt = np.abs(np.diff(t_values))
+        dp_log = np.abs(np.diff(np.log10(p_values)))
+        dp_log = np.maximum(dp_log, 1e-8) # Prevent division by zero
+        
+        # 4. Calculate local gradient (Kelvin per pressure decade)
+        gradients = dt / dp_log
+        
+        # 5. Identify the most severe discontinuity in the ENVELOPE
+        max_idx = np.argmax(gradients)
+        worst_grad = gradients[max_idx]
+        worst_jump = dt[max_idx]
+        median_jump = np.median(dt)
+        
+        # 6. The Clever Check:
+        # A bad stitch is a sharp spike, a statistical outlier, and > 150K.
+        if worst_jump > min_jump_k and worst_jump > (5 * median_jump) and worst_grad > grad_threshold:
+            return False, f"PT_DISCONT_{worst_jump:.0f}K_grad{worst_grad:.1e}"
+            
+        return True, "OK" 
+    
+    @staticmethod
+    def check_pressure_resolution(prof_df, max_dp_log=0.5):
+        """
+        Ensures the profile does not have massive gaps in the pressure grid.
+        Flags any grid where adjacent pressure points jump by more than the allowed limit.
+        """
+        if prof_df is None or prof_df.empty: 
+            return False, "NO_PROFILE_DATA"
+            
+        if 'Pressure_Pa' not in prof_df.columns:
+            return False, "MISSING_PRESSURE_COLUMN"
+            
+        p_values = prof_df['Pressure_Pa'].values
+        
+        # Calculate the absolute step size in log10(Pressure)
+        dp_log = np.abs(np.diff(np.log10(p_values)))
+        
+        # Find the single largest gap in the entire grid
+        max_step = np.max(dp_log)
+        
+        if max_step > max_dp_log:
+            return False, f"GRID_GAP_{max_step:.2f}dex"
+            
+        return True, "OK"
 
     @staticmethod
-    def check_physical_radius(radius_rjup):
-        """Flags planets that are physically impossible (e.g., 5 Jupiter masses but 0.1 Rjup)."""
-        # Simple bounds: Most Gas Giants/Brown Dwarfs fall between 0.7 and 2.5 Rjup
-        return 0.5 < radius_rjup < 3.0
+    def check_physical_radius(r_total_m):
+        """Flags planets with highly unphysical total radii."""
+        if r_total_m is None or np.isnan(r_total_m):
+            return False, "NO_RADIUS_DATA"
+            
+        # Convert meters to Jupiter Radii
+        r_jup = r_total_m / 71492000.0
+        
+        # Flag if radius is smaller than 0.3 Rjup or larger than 4.0 Rjup
+        if r_jup < 0.3 or r_jup > 4.0:
+            return False, f"UNPHYSICAL_RADIUS_{r_jup:.2f}Rj"
+            
+        return True, "OK"
 
     @staticmethod
     def check_cooling_rate(int_raw):
-        """Detects 'flat' cooling rates (dt_ds) which indicate solver failure."""
-        dt_ds = int_raw.get('dt_ds_total', 0)
-        # dt_ds should be a significant positive number. 
-        # 0.0 or nearly 0.0 means the entropy gradient wasn't calculated.
-        return dt_ds > 1e-5 
+        """Checks interior_raw for a valid dt_ds_total."""
+        if not int_raw:
+            return False, "NO_INTERIOR_DATA"
+            
+        dt_ds = int_raw.get('dt_ds_total', 0.0)
+        
+        # If it's exactly 0.0 or NaN, the cooling solver failed
+        if dt_ds == 0.0 or np.isnan(dt_ds):
+            return False, "FLAT_COOLING"
+            
+        return True, "OK"
+    
+    @staticmethod
+    def check_pt_percentage_jump(prof_df, threshold_pct=100.0):
+        """
+        Flags profiles where the temperature jumps by more than a specified 
+        percentage relative to the adjacent layer.
+        """
+        if prof_df is None or prof_df.empty: 
+            return False, "NO_PROFILE_DATA"
+            
+        if 'Temperature_K' not in prof_df.columns:
+            return False, "MISSING_TEMP_COLUMN"
+            
+        t_values = prof_df['Temperature_K'].values
+        
+        if len(t_values) < 2:
+            return True, "OK"
+            
+        dt = np.abs(np.diff(t_values))
+        t_prev = t_values[:-1]
+        
+        # Guard against zero-division just in case
+        t_prev_safe = np.maximum(t_prev, 1e-8)
+        
+        dt_percent = (dt / t_prev_safe) * 100.0
+        
+        max_idx = np.argmax(dt_percent)
+        max_pct_val = dt_percent[max_idx]
+        
+        if max_pct_val > threshold_pct:
+            return False, f"PT_JUMP_{max_pct_val:.0f}PCT"
+            
+        return True, "OK"
 
     @staticmethod
     def validate(data, catalog_entry):
-        """Returns (is_valid, reason)"""
-        prof_df = data.get('stitched_profile')
-        int_raw = data.get('interior_raw', {})
-        r_1bar = catalog_entry.get('R_1bar_Rjup', 0)
+        """Main validation router."""
+        if data.get('status') == 'failed' or 'failure_reason' in data:
+            return False, "SOLVER_FAILED"
 
-        if not ExoFilter.check_pt_continuity(prof_df):
-            return False, "PT_DISCONTINUITY"
-        if not ExoFilter.check_physical_radius(r_1bar):
-            return False, "ERRONEOUS_RADIUS"
-        if not ExoFilter.check_cooling_rate(int_raw):
-            return False, "FLAT_COOLING"
+        prof_df = data.get('stitched_profile') if 'stitched_profile' in data else data.get('profile')
+        int_raw = data.get('interior_raw', {})
+        r_total_m = int_raw.get('R_total', catalog_entry.get('R_total_m'))
+
+        # 1. Grid Resolution Check (prevents massive pressure gaps)
+        grid_ok, grid_reason = ExoFilter.check_pressure_resolution(prof_df)
+        if not grid_ok: return False, grid_reason
+
+        # 2. NEW: Relative Percentage Jump Check (catches >100% thermal jumps anywhere)
+        pct_ok, pct_reason = ExoFilter.check_pt_percentage_jump(prof_df, threshold_pct=100.0)
+        if not pct_ok: return False, pct_reason
+
+        # 3. Absolute Gradient Check (safeguards the envelope stitch)
+        pt_ok, pt_reason = ExoFilter.check_pt_continuity(prof_df, catalog_entry)
+        if not pt_ok: return False, pt_reason
+        
+        # 4. Physical Radius Check
+        rad_ok, rad_reason = ExoFilter.check_physical_radius(r_total_m)
+        if not rad_ok: return False, rad_reason
+        
+        # 5. Cooling Rate Check
+        cool_ok, cool_reason = ExoFilter.check_cooling_rate(int_raw)
+        if not cool_ok: return False, cool_reason
         
         return True, "VALID"
+    
 
 def compile_exoweave_grid(input_dir: str, output_prefix: str):
     """
