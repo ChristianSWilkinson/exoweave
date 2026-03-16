@@ -292,8 +292,9 @@ class ExoCoupler:
                 t_int_diff = abs(saved.get('T_int', 500) - self.params['T_int']) / max(self.params['T_int'], 1)
                 t_irr_diff = abs(saved.get('T_irr', 500) - self.params.get('T_irr', 500)) / max(self.params.get('T_irr', 500), 1)
                 met_diff = abs(saved.get('Met', 0.0) - self.params.get('Met', 0.0))
+                sigma_diff = abs(saved.get('sigma_val', 0.0) - self.params.get('sigma_val', 0.0))
                 
-                dist = np.sqrt(m_diff**2 + t_int_diff**2 + t_irr_diff**2 + met_diff**2)
+                dist = np.sqrt(m_diff**2 + t_int_diff**2 + t_irr_diff**2 + met_diff**2 + sigma_diff**2)
                 
                 if dist < best_distance and dist < threshold:
                     best_distance = dist

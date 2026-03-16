@@ -9,6 +9,50 @@ from pathlib import Path
 # Set up clean logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
+import numpy as np
+import pandas as pd
+
+class ExoFilter:
+    """Detects physical unreliability in ExoWeave model outputs."""
+    
+    @staticmethod
+    def check_pt_continuity(prof_df, threshold_k=500):
+        """Detects massive temperature jumps at the stitching boundary."""
+        if prof_df is None or prof_df.empty: return False
+        # Calculate the absolute difference between adjacent temperature points
+        t_diff = np.abs(np.diff(prof_df['Temperature_K'].values))
+        return np.max(t_diff) < threshold_k
+
+    @staticmethod
+    def check_physical_radius(radius_rjup):
+        """Flags planets that are physically impossible (e.g., 5 Jupiter masses but 0.1 Rjup)."""
+        # Simple bounds: Most Gas Giants/Brown Dwarfs fall between 0.7 and 2.5 Rjup
+        return 0.5 < radius_rjup < 3.0
+
+    @staticmethod
+    def check_cooling_rate(int_raw):
+        """Detects 'flat' cooling rates (dt_ds) which indicate solver failure."""
+        dt_ds = int_raw.get('dt_ds_total', 0)
+        # dt_ds should be a significant positive number. 
+        # 0.0 or nearly 0.0 means the entropy gradient wasn't calculated.
+        return dt_ds > 1e-5 
+
+    @staticmethod
+    def validate(data, catalog_entry):
+        """Returns (is_valid, reason)"""
+        prof_df = data.get('stitched_profile')
+        int_raw = data.get('interior_raw', {})
+        r_1bar = catalog_entry.get('R_1bar_Rjup', 0)
+
+        if not ExoFilter.check_pt_continuity(prof_df):
+            return False, "PT_DISCONTINUITY"
+        if not ExoFilter.check_physical_radius(r_1bar):
+            return False, "ERRONEOUS_RADIUS"
+        if not ExoFilter.check_cooling_rate(int_raw):
+            return False, "FLAT_COOLING"
+        
+        return True, "VALID"
+
 def compile_exoweave_grid(input_dir: str, output_prefix: str):
     """
     Scans a directory of ExoWeave .pkl outputs and compiles them into:
@@ -116,6 +160,14 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                 'R_1bar_Rjup': np.nan,    
                 'original_file': pkl_file.name
             }
+
+            is_valid, reason = ExoFilter.validate(data, catalog_entry)
+            catalog_entry['qc_status'] = reason
+
+            if not is_valid:
+                logging.warning(f"⚠️ Model {model_id} failed QC: {reason}. Skipping binary export.")
+                summary_catalog.append(catalog_entry)
+                continue # Skip writing to HDF5, but keep in CSV for tracking
 
             # --- 3. Extract Arrays, Interpolate Radius, and Pull Photometry ---
             prof_df = data.get('profile') if 'profile' in data else data.get('stitched_profile')

@@ -15,10 +15,11 @@ def _generate_filename(params: dict, actual_mass: float = None, suffix: str = ""
     core = params.get('core_mass_earth', 0.0)
     fsed = params.get('f_sed', 0.0)
     kzz = params.get('kzz', 0.0)
+    sigma = params.get('sigma_val', 0.0)
     
-    # Format: M_1.000_Tirr_100.0_Tint_500.0_Met_0.00_Core_15.0_fsed_1.0_kzz_8.0
+    # Format: M_1.000_Tirr_100.0_Tint_500.0_Met_0.00_Core_15.0_fsed_1.0_kzz_8.0_sigma_0.05
     base = (f"M_{mass:.3f}_Tirr_{t_irr:.1f}_Tint_{t_int:.1f}_"
-            f"Met_{met:.2f}_Core_{core:.1f}_fsed_{fsed:.1f}_kzz_{kzz:.1f}")
+            f"Met_{met:.2f}_Core_{core:.1f}_fsed_{fsed:.1f}_kzz_{kzz:.1f}_sigma_{sigma:.2f}")
     
     if suffix:
         return f"{base}_{suffix}.pkl"
