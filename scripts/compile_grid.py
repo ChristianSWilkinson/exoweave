@@ -154,6 +154,20 @@ class ExoFilter:
         return True, "OK"
 
     @staticmethod
+    def check_max_tint(t_int_true_k, max_t_int=2000.0):
+        """
+        Flags models where the true internal temperature exceeds the physical 
+        validity of the opacity tables.
+        """
+        if t_int_true_k is None or np.isnan(t_int_true_k):
+            return False, "NO_TINT_DATA"
+            
+        if t_int_true_k > max_t_int:
+            return False, f"TINT_TOO_HIGH_{t_int_true_k:.0f}K"
+            
+        return True, "OK"
+
+    @staticmethod
     def validate(data, catalog_entry):
         """Main validation router."""
         if data.get('status') == 'failed' or 'failure_reason' in data:
@@ -162,16 +176,17 @@ class ExoFilter:
         prof_df = data.get('stitched_profile') if 'stitched_profile' in data else data.get('profile')
         int_raw = data.get('interior_raw', {})
         r_total_m = int_raw.get('R_total', catalog_entry.get('R_total_m'))
+        t_int_true = catalog_entry.get('T_int_true_K') # Get the true T_int
 
-        # 1. Grid Resolution Check (prevents massive pressure gaps)
+        # 1. Grid Resolution Check
         grid_ok, grid_reason = ExoFilter.check_pressure_resolution(prof_df)
         if not grid_ok: return False, grid_reason
 
-        # 2. NEW: Relative Percentage Jump Check (catches >100% thermal jumps anywhere)
+        # 2. Relative Percentage Jump Check
         pct_ok, pct_reason = ExoFilter.check_pt_percentage_jump(prof_df, threshold_pct=100.0)
         if not pct_ok: return False, pct_reason
 
-        # 3. Absolute Gradient Check (safeguards the envelope stitch)
+        # 3. Absolute Gradient Check
         pt_ok, pt_reason = ExoFilter.check_pt_continuity(prof_df, catalog_entry)
         if not pt_ok: return False, pt_reason
         
@@ -179,7 +194,11 @@ class ExoFilter:
         rad_ok, rad_reason = ExoFilter.check_physical_radius(r_total_m)
         if not rad_ok: return False, rad_reason
         
-        # 5. Cooling Rate Check
+        # 5. NEW: Maximum Valid Temperature Check
+        tint_ok, tint_reason = ExoFilter.check_max_tint(t_int_true, max_t_int=2000.0)
+        if not tint_ok: return False, tint_reason
+        
+        # 6. Cooling Rate Check
         cool_ok, cool_reason = ExoFilter.check_cooling_rate(int_raw)
         if not cool_ok: return False, cool_reason
         
@@ -271,10 +290,15 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                 raw_status = data.get('status', 'converged')
                 if raw_status == 'converged':
                     status = 'target_reached'
+                elif raw_status == 'intermediate':
+                    status = 'intermediate_step'  # Explicitly label them!
                 else:
                     status = 'max_iterations_reached'
 
             # --- 2. Build the Base Catalog Entry ---
+            # Look for both plural and singular keys
+            iters = data.get('iterations', data.get('iteration', np.nan))
+
             catalog_entry = {
                 'model_id': model_id,
                 'status': status,
@@ -287,7 +311,7 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
                 'core_mass_Me': params.get('core_mass_earth', np.nan),
                 'f_sed': params.get('f_sed', np.nan),
                 'kzz': params.get('kzz', np.nan),
-                'iterations': data.get('iterations', np.nan),
+                'iterations': iters, # Use the safely extracted value
                 'P_link_bar': params.get('p_link_bar', np.nan),
                 'R_total_m': np.nan,      
                 'R_1bar_Rjup': np.nan,    
@@ -304,32 +328,50 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
 
             # --- 3. Extract Arrays, Interpolate Radius, and Pull Photometry ---
             prof_df = data.get('profile') if 'profile' in data else data.get('stitched_profile')
-            atm_df = data.get('atmosphere_raw')
             int_raw = data.get('interior_raw', {})
             phot_data = data.get('photometry', {})
+            atm_df = data.get('atmosphere_raw')
+
+            # ---------------------------------------------------------
+            # Extract scalar metrics for ANY model that has data
+            # ---------------------------------------------------------
             
-            if status in ['target_reached', 'max_iterations_reached'] and prof_df is not None and not prof_df.empty:
-                r_cols = [c for c in prof_df.columns if 'rad' in c.lower()]
-                p_cols = [c for c in prof_df.columns if 'press' in c.lower()]
-                
-                if r_cols:
-                    r_col = r_cols[0]
-                    catalog_entry['R_total_m'] = prof_df[r_col].max()
+            # 1. Radius Interpolation
+            if prof_df is not None and 'Pressure_bar' in prof_df.columns and 'Radius_m' in prof_df.columns:
+                try:
+                    # Sort by pressure just to be safe for interpolation
+                    sorted_prof = prof_df.sort_values('Pressure_bar')
                     
-                    if p_cols:
-                        p_col = p_cols[0]
-                        log_p = np.log10(prof_df[p_col].values)
-                        r_m = prof_df[r_col].values
-                        sort_idx = np.argsort(log_p)
-                        r_1bar_m = np.interp(0.0, log_p[sort_idx], r_m[sort_idx])
-                        catalog_entry['R_1bar_Rjup'] = r_1bar_m / R_JUPITER_M
+                    # Interpolate the radius at exactly 1.0 bar
+                    r_1bar_m = np.interp(1.0, sorted_prof['Pressure_bar'], sorted_prof['Radius_m'])
+                    catalog_entry['R_1bar_Rjup'] = r_1bar_m / 71492000.0
+                    
+                    # Grab total radius from interior if available
+                    if int_raw and 'R_total' in int_raw:
+                        catalog_entry['R_total_m'] = int_raw['R_total']
+                except Exception as e:
+                    logging.debug(f"Could not interpolate radius for {model_id}: {e}")
 
-                if 'bands' in phot_data:
-                    for filter_id, metrics in phot_data['bands'].items():
-                        safe_name = filter_id.replace('/', '_')
-                        catalog_entry[f"{safe_name}_flux_Wm2um"] = metrics.get('flux_W_m2_um', np.nan)
-                        catalog_entry[f"{safe_name}_flux_Jy"] = metrics.get('flux_Jy', np.nan)
+            # 2. Photometry Extraction
+            if phot_data and 'bands' in phot_data:
+                for filt_id, metrics in phot_data['bands'].items():
+                    safe_filt_id = filt_id.replace('/', '_')
+                    if 'flux_W_m2_um' in metrics:
+                        catalog_entry[f"{safe_filt_id}_flux_Wm2um"] = metrics['flux_W_m2_um']
+                    if 'flux_Jy' in metrics:
+                        catalog_entry[f"{safe_filt_id}_flux_Jy"] = metrics['flux_Jy']
 
+            # =================================================================
+            # RUN QUALITY CONTROL FILTER (Happens AFTER we extract the radius)
+            # =================================================================
+            is_valid, reason = ExoFilter.validate(data, catalog_entry)
+            catalog_entry['qc_status'] = reason
+            
+            if not is_valid:
+                logging.warning(f"⚠️ Model {model_id} failed QC: {reason}. Skipping binary export.")
+                summary_catalog.append(catalog_entry)
+                continue 
+            
             # --- 4. Populate the Master HDF5 Structure ---
             if model_id in h5f:
                 del h5f[model_id]
