@@ -233,7 +233,7 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
     logging.info(f"🚀 Starting compilation of {total_files} models...")
 
     # Open both HDF5 files in append mode to build the grid
-    with h5py.File(h5_path, 'a') as h5_master, h5py.File(cooltrack_path, 'a') as h5_cool:
+    with h5py.File(h5_path, 'w') as h5_master, h5py.File(cooltrack_path, 'w') as h5_cool:
         
         for idx, pkl_file in enumerate(pkl_files):
             model_id = f"model_{idx:05d}"
