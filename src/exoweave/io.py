@@ -40,6 +40,7 @@ def save_step_model(step_data: dict, output_dir: str | Path) -> Path:
     filepath = out_dir / filename
     
     try:
+        # Step models already dump the full dictionary provided by coupler.py
         with open(filepath, 'wb') as f:
             pkl.dump(step_data, f)
         logging.debug(f"💾 Step {iteration} saved to: {filepath}")
@@ -59,6 +60,7 @@ def save_converged_model(results: dict, output_dir: str | Path, custom_name: str
     filename = custom_name if custom_name else _generate_filename(params)
     filepath = out_dir / filename
     
+    # 🚨 FIXED: Now explicitly identical in structure to the step_data dictionary
     data_to_save = {
         'status': 'converged',
         'timestamp': datetime.now().isoformat(),
@@ -66,7 +68,8 @@ def save_converged_model(results: dict, output_dir: str | Path, custom_name: str
         'iterations': results.get('iterations'),
         'profile': results.get('stitched_profile'), 
         'atmosphere_raw': results.get('atmosphere_raw'),
-        'interior_raw': results.get('interior_raw')
+        'interior_raw': results.get('interior_raw'),
+        'photometry': results.get('photometry')
     }
     
     try:

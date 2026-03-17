@@ -1,6 +1,8 @@
 import logging
 import numpy as np
 import pandas as pd
+import pickle
+from pathlib import Path
 
 from exowrap.output import ExoremOut
 from exowrap.photometry import get_svo_filter
@@ -207,65 +209,71 @@ def calculate_stitched_mass(atm_out, int_results: dict, p_link_bar: float) -> tu
         
     return m_current, interior_mass_kg, m_atm_kg
 
-# Global cache to prevent spamming the SVO servers!
-# Stores filters as: {'filter_id': (wav_microns_array, transmission_array)}
+# ---------------------------------------------------------
+# GLOBAL FILTER LIST & DISK CACHE SETUP
+# ---------------------------------------------------------
+TARGET_FILTERS = [
+    # --- JWST ---
+    "JWST/NIRCam.F070W", "JWST/NIRCam.F090W", "JWST/NIRCam.F115W", "JWST/NIRCam.F140M", 
+    "JWST/NIRCam.F150W", "JWST/NIRCam.F182M", "JWST/NIRCam.F200W", "JWST/NIRCam.F210M", 
+    "JWST/NIRCam.F250M", "JWST/NIRCam.F277W", "JWST/NIRCam.F300M", "JWST/NIRCam.F335M", 
+    "JWST/NIRCam.F356W", "JWST/NIRCam.F410M", "JWST/NIRCam.F430M", "JWST/NIRCam.F444W", 
+    "JWST/NIRCam.F460M", "JWST/NIRCam.F480M",
+    "JWST/MIRI.F560W", "JWST/MIRI.F770W", "JWST/MIRI.F1000W", "JWST/MIRI.F1130W", 
+    "JWST/MIRI.F1280W", "JWST/MIRI.F1500W", "JWST/MIRI.F1800W", "JWST/MIRI.F2100W", "JWST/MIRI.F2550W",
+    "JWST/NIRISS.F090W", "JWST/NIRISS.F115W", "JWST/NIRISS.F140M", "JWST/NIRISS.F150W", 
+    "JWST/NIRISS.F158M", "JWST/NIRISS.F200W", "JWST/NIRISS.F277W", "JWST/NIRISS.F380M", 
+    "JWST/NIRISS.F430M", "JWST/NIRISS.F480M",
+    
+    # --- VLT (Paranal) ---
+    "Paranal/SPHERE.IRDIS_B_Y", "Paranal/SPHERE.IRDIS_B_J", "Paranal/SPHERE.IRDIS_B_H", "Paranal/SPHERE.IRDIS_B_Ks",
+    "Paranal/SPHERE.IRDIS_D_J23_2", "Paranal/SPHERE.IRDIS_D_J23_3", 
+    "Paranal/SPHERE.IRDIS_D_H23_2", "Paranal/SPHERE.IRDIS_D_H23_3", 
+    "Paranal/SPHERE.IRDIS_D_K12_1", "Paranal/SPHERE.IRDIS_D_K12_2",
+    "Paranal/NACO.J", "Paranal/NACO.H", "Paranal/NACO.Ks", "Paranal/NACO.Lp", "Paranal/NACO.Mp",
+    "Paranal/HAWKI.J", "Paranal/HAWKI.H", "Paranal/HAWKI.Ks", "Paranal/HAWKI.CH4",
+    "Paranal/VISIR.B8_7", "Paranal/VISIR.B10_7", "Paranal/VISIR.B11_7", "Paranal/VISIR.Q2",
+    
+    # --- KECK & GEMINI ---
+    "Keck/NIRC2.J", "Keck/NIRC2.H", "Keck/NIRC2.Ks", "Keck/NIRC2.Kp", "Keck/NIRC2.Lp", "Keck/NIRC2.Ms",
+    "Gemini/NIRI.J", "Gemini/NIRI.H", "Gemini/NIRI.K", "Gemini/NIRI.L-prime", "Gemini/NIRI.M-prime",
+    
+    # --- SPACE: HST, SPITZER, WISE ---
+    "HST/WFC3_IR.F110W", "HST/WFC3_IR.F140W", "HST/WFC3_IR.F160W", "HST/WFC3_UVIS1.F606W", "HST/WFC3_UVIS1.F814W",
+    "Spitzer/IRAC.I1", "Spitzer/IRAC.I2", "Spitzer/IRAC.I3", "Spitzer/IRAC.I4",
+    "WISE/WISE.W1", "WISE/WISE.W2", "WISE/WISE.W3", "WISE/WISE.W4",
+    
+    # --- NEXT-GEN SPACE: ROMAN ---
+    "Roman/WFI.F062", "Roman/WFI.F087", "Roman/WFI.F106", "Roman/WFI.F129", 
+    "Roman/WFI.F146", "Roman/WFI.F158", "Roman/WFI.F184",
+    
+    # --- ALL-SKY SURVEYS: 2MASS, SDSS, PAN-STARRS, GAIA, TESS ---
+    "2MASS/2MASS.J", "2MASS/2MASS.H", "2MASS/2MASS.Ks",
+    "SLOAN/SDSS.u", "SLOAN/SDSS.g", "SLOAN/SDSS.r", "SLOAN/SDSS.i", "SLOAN/SDSS.z",
+    "PAN-STARRS/PS1.g", "PAN-STARRS/PS1.r", "PAN-STARRS/PS1.i", "PAN-STARRS/PS1.z", "PAN-STARRS/PS1.y",
+    "GAIA/GAIA3.G", "GAIA/GAIA3.Gbp", "GAIA/GAIA3.Grp",
+    "TESS/TESS.Red", "Kepler/Kepler.K"
+]
+
+# Physical file shared by all CPU cores
+CACHE_FILE = Path(__file__).resolve().parent / "svo_filter_cache.pkl"
 _FILTER_CACHE = {}
+
+# Load the disk cache into memory as soon as a CPU core imports this file
+if CACHE_FILE.exists():
+    try:
+        with open(CACHE_FILE, 'rb') as f:
+            _FILTER_CACHE = pickle.load(f)
+    except Exception:
+        pass
 
 def calculate_comprehensive_photometry(atm_out) -> dict:
     """
-    Extracts raw spectral arrays and computes synthetic photometry across a 
-    massive catalog of JWST, VLT, Keck, HST, and survey filters. Uses an 
-    in-memory cache to prevent IP bans from the SVO Filter Profile Service.
+    Extracts raw spectral arrays and computes synthetic photometry. 
+    Relies on a pre-warmed shared disk cache to prevent SVO Server bans.
     """
-    logging.info("🌟 Computing Mega-Catalog Photometry (Cached)...")
+    logging.info("🌟 Computing Mega-Catalog Photometry (Using Disk Cache)...")
     
-    # ---------------------------------------------------------
-    # THE ULTIMATE EXOPLANET & BROWN DWARF FILTER CATALOG
-    # ---------------------------------------------------------
-    target_filters = [
-        # --- JWST ---
-        "JWST/NIRCam.F070W", "JWST/NIRCam.F090W", "JWST/NIRCam.F115W", "JWST/NIRCam.F140M", 
-        "JWST/NIRCam.F150W", "JWST/NIRCam.F182M", "JWST/NIRCam.F200W", "JWST/NIRCam.F210M", 
-        "JWST/NIRCam.F250M", "JWST/NIRCam.F277W", "JWST/NIRCam.F300M", "JWST/NIRCam.F335M", 
-        "JWST/NIRCam.F356W", "JWST/NIRCam.F410M", "JWST/NIRCam.F430M", "JWST/NIRCam.F444W", 
-        "JWST/NIRCam.F460M", "JWST/NIRCam.F480M",
-        "JWST/MIRI.F560W", "JWST/MIRI.F770W", "JWST/MIRI.F1000W", "JWST/MIRI.F1130W", 
-        "JWST/MIRI.F1280W", "JWST/MIRI.F1500W", "JWST/MIRI.F1800W", "JWST/MIRI.F2100W", "JWST/MIRI.F2550W",
-        "JWST/NIRISS.F090W", "JWST/NIRISS.F115W", "JWST/NIRISS.F140M", "JWST/NIRISS.F150W", 
-        "JWST/NIRISS.F158M", "JWST/NIRISS.F200W", "JWST/NIRISS.F277W", "JWST/NIRISS.F380M", 
-        "JWST/NIRISS.F430M", "JWST/NIRISS.F480M",
-        
-        # --- VLT (Paranal) ---
-        "Paranal/SPHERE.IRDIS_B_Y", "Paranal/SPHERE.IRDIS_B_J", "Paranal/SPHERE.IRDIS_B_H", "Paranal/SPHERE.IRDIS_B_Ks",
-        "Paranal/SPHERE.IRDIS_D_J23_2", "Paranal/SPHERE.IRDIS_D_J23_3", 
-        "Paranal/SPHERE.IRDIS_D_H23_2", "Paranal/SPHERE.IRDIS_D_H23_3", 
-        "Paranal/SPHERE.IRDIS_D_K12_1", "Paranal/SPHERE.IRDIS_D_K12_2",
-        "Paranal/NACO.J", "Paranal/NACO.H", "Paranal/NACO.Ks", "Paranal/NACO.Lp", "Paranal/NACO.Mp",
-        "Paranal/HAWKI.J", "Paranal/HAWKI.H", "Paranal/HAWKI.Ks", "Paranal/HAWKI.CH4",
-        "Paranal/VISIR.B8_7", "Paranal/VISIR.B10_7", "Paranal/VISIR.B11_7", "Paranal/VISIR.Q2",
-        
-        # --- KECK & GEMINI ---
-        "Keck/NIRC2.J", "Keck/NIRC2.H", "Keck/NIRC2.Ks", "Keck/NIRC2.Kp", "Keck/NIRC2.Lp", "Keck/NIRC2.Ms",
-        "Gemini/NIRI.J", "Gemini/NIRI.H", "Gemini/NIRI.K", "Gemini/NIRI.L-prime", "Gemini/NIRI.M-prime",
-        
-        # --- SPACE: HST, SPITZER, WISE ---
-        "HST/WFC3_IR.F110W", "HST/WFC3_IR.F140W", "HST/WFC3_IR.F160W", "HST/WFC3_UVIS1.F606W", "HST/WFC3_UVIS1.F814W",
-        "Spitzer/IRAC.I1", "Spitzer/IRAC.I2", "Spitzer/IRAC.I3", "Spitzer/IRAC.I4",
-        "WISE/WISE.W1", "WISE/WISE.W2", "WISE/WISE.W3", "WISE/WISE.W4",
-        
-        # --- NEXT-GEN SPACE: ROMAN ---
-        "Roman/WFI.F062", "Roman/WFI.F087", "Roman/WFI.F106", "Roman/WFI.F129", 
-        "Roman/WFI.F146", "Roman/WFI.F158", "Roman/WFI.F184",
-        
-        # --- ALL-SKY SURVEYS: 2MASS, SDSS, PAN-STARRS, GAIA, TESS ---
-        "2MASS/2MASS.J", "2MASS/2MASS.H", "2MASS/2MASS.Ks",
-        "SLOAN/SDSS.u", "SLOAN/SDSS.g", "SLOAN/SDSS.r", "SLOAN/SDSS.i", "SLOAN/SDSS.z",
-        "PAN-STARRS/PS1.g", "PAN-STARRS/PS1.r", "PAN-STARRS/PS1.i", "PAN-STARRS/PS1.z", "PAN-STARRS/PS1.y",
-        "GAIA/GAIA3.G", "GAIA/GAIA3.Gbp", "GAIA/GAIA3.Grp",
-        "TESS/TESS.Red", "Kepler/Kepler.K"
-    ]
-    
-    # Extract the raw ExoREM spectrum and ensure it is sorted
     exo_wl = getattr(atm_out, 'wavelength', None)
     exo_flux = getattr(atm_out, 'flux_flambda', None)
     
@@ -289,28 +297,26 @@ def calculate_comprehensive_photometry(atm_out) -> dict:
     exo_flux = exo_flux[sort_idx]
 
     # Process all filters
-    for filter_id in target_filters:
+    for filter_id in TARGET_FILTERS:
         try:
-            # --- CACHE CHECK ---
             if filter_id not in _FILTER_CACHE:
-                # Only pings the SVO server if we have literally never seen this filter before!
+                # Fallback: Fetch it and gently update the memory dict
+                # (This will rarely trigger if run_grid pre-warms the cache properly)
                 _FILTER_CACHE[filter_id] = get_svo_filter(filter_id)
                 
             filt_wav, filt_trans = _FILTER_CACHE[filter_id]
             
-            # --- INTEGRATION MATH (Photon Counting by default) ---
+            # --- INTEGRATION MATH ---
             interp_trans = np.interp(exo_wl, filt_wav, filt_trans, left=0.0, right=0.0)
 
             if np.sum(interp_trans) == 0:
-                continue # Spectrum doesn't overlap with this filter, gracefully skip.
+                continue
 
             eff_wav = np.trapz(interp_trans * exo_wl, exo_wl) / np.trapz(interp_trans, exo_wl)
-
             numerator = np.trapz(exo_flux * interp_trans * exo_wl, exo_wl)
             denominator = np.trapz(interp_trans * exo_wl, exo_wl)
 
             phot_flux_flambda = numerator / denominator
-
             c_um_s = 299792458.0 * 1e6
             phot_flux_fnu = phot_flux_flambda * (eff_wav**2) / c_um_s
             phot_flux_jy = phot_flux_fnu * 1e26
@@ -323,8 +329,8 @@ def calculate_comprehensive_photometry(atm_out) -> dict:
             }
             
         except Exception as e:
-            # Fails silently and moves on to the next filter
-            pass
+            # Now logs the error quietly instead of silently hiding server bans
+            logging.debug(f"Skipping {filter_id}: {e}")
 
-    logging.info(f"✅ Successfully cached and computed {len(photometry_section['bands'])} photometric bands!")
+    logging.info(f"✅ Successfully computed {len(photometry_section['bands'])} photometric bands!")
     return photometry_section

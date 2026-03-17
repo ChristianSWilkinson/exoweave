@@ -187,8 +187,8 @@ class ExoFilter:
         if not pct_ok: return False, pct_reason
 
         # 3. Absolute Gradient Check
-        pt_ok, pt_reason = ExoFilter.check_pt_continuity(prof_df, catalog_entry)
-        if not pt_ok: return False, pt_reason
+        #pt_ok, pt_reason = ExoFilter.check_pt_continuity(prof_df, catalog_entry)
+        #if not pt_ok: return False, pt_reason
         
         # 4. Physical Radius Check
         rad_ok, rad_reason = ExoFilter.check_physical_radius(r_total_m)

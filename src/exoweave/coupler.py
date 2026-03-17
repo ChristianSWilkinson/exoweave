@@ -471,6 +471,8 @@ class ExoCoupler:
             
             self.params['z_base'] = z_base
             self.params['Y_ratio'] = y_ratio
+
+            true_t_int = calculate_new_tint(atm_out, fallback_t_int=static_t_int)
             
             z_profile = np.round(generate_gaussian_z_profile(
                 n_layers=100, 
@@ -483,6 +485,7 @@ class ExoCoupler:
             fc_params = {
                 'P_surf': p_link,
                 'T_surf': t_link,
+                'T_int': true_t_int,
                 'M_core': self.params.get('core_mass_earth', 10.0) * c.M_EARTH, 
                 'M_water':  self.params.get('M_water', 0.0) * c.M_EARTH,
                 'iron_fraction': self.params.get('iron_fraction', 0.33),
@@ -517,7 +520,6 @@ class ExoCoupler:
             )
             
             mass_error = (new_mass_kg - target_mass_kg) / target_mass_kg
-            true_t_int = calculate_new_tint(atm_out, fallback_t_int=static_t_int)
             
             self.history['iteration'].append(iteration)
             self.history['mass_error'].append(mass_error)
