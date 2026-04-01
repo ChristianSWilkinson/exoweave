@@ -69,7 +69,8 @@ def save_converged_model(results: dict, output_dir: str | Path, custom_name: str
         'profile': results.get('stitched_profile'), 
         'atmosphere_raw': results.get('atmosphere_raw'),
         'interior_raw': results.get('interior_raw'),
-        'photometry': results.get('photometry')
+        'photometry': results.get('photometry'),
+        'cooling_metrics': results.get('cooling_metrics')
     }
     
     try:

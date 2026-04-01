@@ -2,7 +2,10 @@ import logging
 import numpy as np
 import pandas as pd
 import pickle
+import ssl
 from pathlib import Path
+
+ssl._create_default_https_context = ssl._create_unverified_context
 
 from exowrap.output import ExoremOut
 from exowrap.photometry import get_svo_filter
@@ -10,40 +13,91 @@ from fuzzycore.constants import BAR_TO_PA, SIGMA_SB
 from fuzzycore.utils import calculate_staircase_dt_ds
 from fuzzycore.constants import G_CONST
 
+import logging
+import numpy as np
+
 def calculate_new_tint(
     atm_out, 
     pressure_threshold_bar: float = 10.0, 
     fallback_t_int: float = np.nan
 ) -> float:
     """
-    Calculates the true Intrinsic Temperature (T_int) by isolating ExoREM's 
-    explicit internal heat flux tracker (radiosity_internal) deep in the atmosphere.
+    Calculates the true Intrinsic Temperature (T_int) by isolating the internal 
+    radiosity exactly at the deep Radiative-Convective Boundary (RCB), avoiding 
+    both convective drop-offs below and stellar contamination above.
     """
-    logging.debug("Extracting true T_int from deep internal radiosity...")
+    logging.debug("Extracting true T_int strictly at the deep RCB...")
     
     try:
         df = atm_out.df
-        p_pa = np.asarray(df['/outputs/levels/pressure'].iloc[0])
-        
-        # ExoREM perfectly isolates the net internal heat flux in this array!
+        p_bar = np.asarray(df['/outputs/levels/pressure'].iloc[0]) / 1e5
         rad_int = np.asarray(df['/outputs/levels/radiosity_internal'].iloc[0])
+        is_conv = np.asarray(df['/outputs/levels/is_convective'].iloc[0])
         
-        # Mask for the deep atmosphere to avoid upper atmospheric noise
-        p_threshold_pa = pressure_threshold_bar * 1e5
-        deep_mask = p_pa >= p_threshold_pa
+        # --- 1. Direction-Agnostic Scan for the True Deep RCB ---
+        n_layers = len(is_conv)
+        clear_space = 3
+        p_rcb = np.nan
         
-        if np.any(deep_mask):
-            avg_internal_flux = np.nanmean(rad_int[deep_mask])
+        # Check if the deep atmosphere is ALREADY purely radiative (highly irradiated limit)
+        p_mask = p_bar >= pressure_threshold_bar
+        if np.any(p_mask) and np.all(is_conv[p_mask] == 0):
+            p_rcb = np.max(p_bar[p_mask])
+        else:
+            # Find the physical bottom of the grid and the direction of "Up"
+            bottom_idx = np.argmax(p_bar)
+            step = 1 if bottom_idx == 0 else -1
+            idx = bottom_idx
             
-            if avg_internal_flux > 0:
-                t_int_comp = (avg_internal_flux / 5.67e-8) ** 0.25
-                return float(t_int_comp)
+            def is_valid(i): return 0 <= i < n_layers
+            
+            while is_valid(idx):
+                # Skip artificial radiative boundary layers at the very bottom
+                while is_valid(idx) and is_conv[idx] == 0: idx += step
+                if not is_valid(idx): break
+                
+                # Move up through the deep convective zone
+                while is_valid(idx) and is_conv[idx] == 1: idx += step
+                if not is_valid(idx): break
+                    
+                # Check for a "clear space" of radiative layers to avoid getting snagged on blips
+                if step == 1:
+                    block = is_conv[idx : min(idx + clear_space, n_layers)]
+                else:
+                    block = is_conv[max(0, idx - clear_space + 1) : idx + 1]
+                    
+                if np.all(block == 0):
+                    p_rcb = p_bar[idx - step] # The last convective layer
+                    break
+                else:
+                    pass # Just a blip, keep scanning upward
+        
+        # --- 2. Extract Flux exactly at the RCB ---
+        if not np.isnan(p_rcb):
+            idx_rcb = np.argmin(np.abs(p_bar - p_rcb))
+            
+            # Average the 3 layers immediately above the RCB in the radiative zone
+            if step == 1:
+                slice_indices = list(range(idx_rcb, min(idx_rcb + 3, n_layers)))
+            else:
+                slice_indices = list(range(max(0, idx_rcb - 2), idx_rcb + 1))
+            
+            rcb_flux = np.nanmean(rad_int[slice_indices])
+            
+            # --- 3. Calculate T_int (with QC for non-converged negative fluxes) ---
+            if rcb_flux > 0:
+                t_int_rcb = (rcb_flux / SIGMA_SB) ** 0.25
+                logging.debug(f"Found true T_int = {t_int_rcb:.2f} K at {p_rcb:.2f} bar.")
+                return float(t_int_rcb)
+            else:
+                logging.warning(f"⚠️ RCB flux is negative or zero ({rcb_flux:.2f} W/m^2). "
+                                f"Likely a non-converged deep profile.")
 
-        # Only used if the entire array is negative/corrupted
+        # Fallback if fully corrupted or unable to locate boundary
         return fallback_t_int
 
     except Exception as e:
-        logging.error(f"⚠️ Error verifying T_int: {e}. Falling back to dial value.")
+        logging.error(f"⚠️ Error verifying T_int at RCB: {e}. Falling back to dial value.")
         return fallback_t_int
 
 
@@ -67,8 +121,8 @@ def calculate_entropy_evolution(int_results: dict, t_int: float) -> dict:
     total_dt_ds = cooling_data['total_dt_ds']
     
     # 2. Invert to get ds/dt (Entropy decreases as the planet cools, hence negative)
-    if total_dt_ds > 0 and not np.isinf(total_dt_ds):
-        ds_dt = -1.0 / total_dt_ds
+    if total_dt_ds < 0 and not np.isinf(total_dt_ds):
+        ds_dt = 1.0 / total_dt_ds
     else:
         logging.warning("fuzzycore returned invalid dt/dS. Setting ds/dt to NaN.")
         ds_dt = np.nan
@@ -276,11 +330,12 @@ def calculate_comprehensive_photometry(atm_out) -> dict:
     
     exo_wl = getattr(atm_out, 'wavelength', None)
     exo_flux = getattr(atm_out, 'flux_flambda', None)
+    transit_depth = getattr(atm_out, 'transmission', None)
     
     photometry_section = {
         'wavelength_um': exo_wl,
         'emission_flux_W_m2_um': exo_flux,
-        'transit_depth': getattr(atm_out, 'transit_depth', None), 
+        'transit_depth': transit_depth, 
         'bands': {}
     }
     

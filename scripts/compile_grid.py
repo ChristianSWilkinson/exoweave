@@ -9,9 +9,6 @@ from pathlib import Path
 # Set up clean logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-import numpy as np
-import pandas as pd
-
 class ExoFilter:
     """Quality Control filter using exact ExoWeave .pkl and HDF5 keys."""
     
@@ -117,6 +114,9 @@ class ExoFilter:
         # If it's exactly 0.0 or NaN, the cooling solver failed
         if dt_ds == 0.0 or np.isnan(dt_ds):
             return False, "FLAT_COOLING"
+        
+        if dt_ds >= 0.0 or np.isnan(dt_ds):
+            return False, "POSITIVE_COOLING"
             
         return True, "OK"
     
@@ -176,7 +176,7 @@ class ExoFilter:
         prof_df = data.get('stitched_profile') if 'stitched_profile' in data else data.get('profile')
         int_raw = data.get('interior_raw', {})
         r_total_m = int_raw.get('R_total', catalog_entry.get('R_total_m'))
-        t_int_true = catalog_entry.get('T_int_true_K') # Get the true T_int
+        t_int_true = catalog_entry.get('T_int_true_K')
 
         # 1. Grid Resolution Check
         grid_ok, grid_reason = ExoFilter.check_pressure_resolution(prof_df)
@@ -185,25 +185,81 @@ class ExoFilter:
         # 2. Relative Percentage Jump Check
         pct_ok, pct_reason = ExoFilter.check_pt_percentage_jump(prof_df, threshold_pct=100.0)
         if not pct_ok: return False, pct_reason
-
-        # 3. Absolute Gradient Check
-        #pt_ok, pt_reason = ExoFilter.check_pt_continuity(prof_df, catalog_entry)
-        #if not pt_ok: return False, pt_reason
         
-        # 4. Physical Radius Check
+        # 3. Physical Radius Check
         rad_ok, rad_reason = ExoFilter.check_physical_radius(r_total_m)
         if not rad_ok: return False, rad_reason
         
-        # 5. NEW: Maximum Valid Temperature Check
+        # 4. Maximum Valid Temperature Check
         tint_ok, tint_reason = ExoFilter.check_max_tint(t_int_true, max_t_int=2000.0)
         if not tint_ok: return False, tint_reason
         
-        # 6. Cooling Rate Check
+        # 5. Cooling Rate Check
         cool_ok, cool_reason = ExoFilter.check_cooling_rate(int_raw)
         if not cool_ok: return False, cool_reason
         
         return True, "VALID"
-    
+
+# =============================================================================
+# RECURSIVE HDF5 SAVER 
+# =============================================================================
+def _recursively_save_dict_to_hdf5(h5_obj, d):
+    """
+    Recursively saves a Python dictionary into an HDF5 group.
+    Handles nested dicts, pandas DataFrames, numpy arrays, lists, and scalars.
+    """
+    for key, item in d.items():
+        safe_key = str(key).replace('/', '_')
+        
+        if isinstance(item, dict):
+            sub_group = h5_obj.create_group(safe_key)
+            _recursively_save_dict_to_hdf5(sub_group, item)
+            
+        elif isinstance(item, pd.DataFrame):
+            df_group = h5_obj.create_group(safe_key)
+            for col in item.columns:
+                safe_col = str(col).replace('/', '_')
+                col_data = item[col].values
+                
+                # 🚨 THE FIX: Unpack hidden arrays from 1-row DataFrames (ExoREM format)
+                if col_data.dtype == 'O':
+                    if len(col_data) == 1 and isinstance(col_data[0], (list, np.ndarray)):
+                        col_data = np.array(col_data[0])
+                
+                # If it's still an object/string array after unpacking, safely stringify
+                if col_data.dtype == 'O' or str(col_data.dtype).startswith('<U'):
+                    try:
+                        col_data = np.array([str(val) for val in col_data], dtype=h5py.string_dtype(encoding='utf-8'))
+                    except Exception:
+                        pass
+                        
+                try:
+                    df_group.create_dataset(safe_col, data=col_data)
+                except Exception:
+                    df_group.attrs[safe_col] = str(col_data)
+                    
+        elif isinstance(item, (np.ndarray, list, tuple)):
+            try:
+                arr = np.array(item)
+                
+                # Unpack nested lists if necessary
+                if arr.dtype == 'O' and len(arr) == 1 and isinstance(arr[0], (list, np.ndarray)):
+                    arr = np.array(arr[0])
+                    
+                if arr.dtype == 'O' or str(arr.dtype).startswith('<U'):
+                    arr = np.array([str(val) for val in arr], dtype=h5py.string_dtype(encoding='utf-8'))
+                h5_obj.create_dataset(safe_key, data=arr)
+            except Exception:
+                h5_obj.attrs[safe_key] = str(item)
+                
+        elif isinstance(item, (int, float, str, bytes, bool, np.generic)):
+            h5_obj.attrs[safe_key] = item
+            
+        elif item is None:
+            h5_obj.attrs[safe_key] = "None"
+            
+        else:
+            h5_obj.attrs[safe_key] = str(item)
 
 def compile_exoweave_grid(input_dir: str, output_prefix: str):
     """
@@ -316,7 +372,6 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
             # =================================================================
             # 4. RUN QUALITY CONTROL FILTER
             # =================================================================
-            # NOTE: Assumes you have the ExoFilter class defined above this function
             is_valid, reason = ExoFilter.validate(data, catalog_entry)
             catalog_entry['qc_status'] = reason
             
@@ -331,48 +386,9 @@ def compile_exoweave_grid(input_dir: str, output_prefix: str):
             # 5. HDF5 MASTER & COOLTRACK EXPORT (Runs for all VALID models)
             # =================================================================
             
-            # --- 5a. Master HDF5 File ---
+            # --- 5a. Master HDF5 File (Saves EVERYTHING perfectly) ---
             model_grp = h5_master.create_group(model_id)
-            
-            # Parameters
-            param_grp = model_grp.create_group('parameters')
-            for k, v in params.items():
-                if isinstance(v, (int, float, str, bytes, bool)):
-                    param_grp.attrs[k] = v
-
-            # Interior Arrays
-            if int_raw:
-                int_grp = model_grp.create_group('interior_raw')
-                for k, v in int_raw.items():
-                    if isinstance(v, (int, float, str, bytes, bool)):
-                        int_grp.attrs[k] = v
-                    elif isinstance(v, (np.ndarray, list)):
-                        int_grp.create_dataset(k, data=np.array(v))
-                        
-            # Stitched Profile
-            if prof_df is not None and not prof_df.empty:
-                prof_grp = model_grp.create_group('stitched_profile')
-                for col in prof_df.columns:
-                    prof_grp.create_dataset(col, data=prof_df[col].values)
-            
-            # Photometry
-            if phot_data and 'bands' in phot_data:
-                phot_grp = model_grp.create_group('photometry')
-                
-                # Save raw spectra if present
-                if 'wavelength_um' in phot_data and 'emission_flux_W_m2_um' in phot_data:
-                    phot_grp.create_dataset('wavelength_um', data=phot_data['wavelength_um'])
-                    phot_grp.create_dataset('emission_flux_W_m2_um', data=phot_data['emission_flux_W_m2_um'])
-                
-                # Save integrated bands
-                bands_grp = phot_grp.create_group('bands')
-                for filt_id, metrics in phot_data['bands'].items():
-                    safe_filt_id = filt_id.replace('/', '_')
-                    f_grp = bands_grp.create_group(safe_filt_id)
-                    f_grp.attrs['filter_id'] = filt_id
-                    for k, v in metrics.items():
-                        if k != 'filter_id': # already saved
-                            f_grp.attrs[k] = v
+            _recursively_save_dict_to_hdf5(model_grp, data)
 
             # --- 5b. CoolTrack Sub-Extract ---
             # Lightweight extract specifically for cooling track algorithms

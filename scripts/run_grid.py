@@ -4,6 +4,7 @@ import logging
 import pickle
 import numpy as np
 from pathlib import Path
+from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Import ExoWeave Coupler
@@ -13,23 +14,34 @@ from exoweave.coupler import ExoCoupler
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # =============================================================================
-# 1. GRID DEFINITION (RANDOMIZED)
+# 1A. REGULAR GRID DEFINITION
 # =============================================================================
-# Define the Min and Max bounds for each parameter axis.
-# If you want a parameter to remain static (like T_irr), just set min and max to the same value.
-
-PARAM_BOUNDS = {
-    "mass": (0.05, 13.0),             # Jupiter Masses
-    "T_int": (1000.0, 1600.0),        # Internal Temperatures (K)
-    "T_irr": (0.0, 1500.0),       # Irradiation (K) - Static example
-    "Met": (-2, 2),                 # Metallicity (log10 Z/Z_solar)
-    "core_mass_earth": (1, 100),    # Solid core mass in Earth masses
-    "f_sed": (1.0, 7.0),            # Cloud sedimentation
-    "kzz": (0.0, 12.0)               # Eddy diffusion (log10)
+# Define specific values to compute every possible permutation.
+REGULAR_GRID = {
+    "mass": [1.0],        # Jupiter Masses
+    "T_int": np.arange(100, 1800, 10),    # Internal Temperatures (K)
+    "T_irr": [100],        # Irradiation (K)
+    "Met": [0.0],   # Metallicity (log10 Z/Z_solar)
+    "core_mass_earth": [10.0],      # Solid core mass in Earth masses
+    "f_sed": [3.0],                       # Cloud sedimentation
+    "kzz": [8.0]                          # Eddy diffusion (log10)
 }
 
-TOTAL_RANDOM_MODELS = 1000  # Define how many total models you want to generate
-RANDOM_SEED = 42           # Crucial for resumability! Do not change once a run starts.
+# =============================================================================
+# 1B. RANDOM GRID DEFINITION
+# =============================================================================
+PARAM_BOUNDS = {
+    "mass": (0.05, 13.0),             
+    "T_int": (1000.0, 1600.0),        
+    "T_irr": (0.0, 1500.0),       
+    "Met": (-2, 2),                 
+    "core_mass_earth": (1, 100),    
+    "f_sed": (1.0, 7.0),            
+    "kzz": (0.0, 12.0)               
+}
+
+TOTAL_RANDOM_MODELS = 0          
+
 # -------------------------------------
 
 # Static parameters shared across all models in the grid
@@ -44,15 +56,33 @@ GRID_CONFIG = {
     "max_iterations": 15,
     "mass_convergence_threshold": 0.01,
     "p_bottom_bar": 1000.0,
-    
-    # --- Resolution Setup ---
     "resolution": 50,           
     "target_resolution": 500    
 }
 
 # =============================================================================
-# 2. WORKER FUNCTION
+# 2. CACHE & WORKER FUNCTIONS
 # =============================================================================
+def get_cache_key(m, tint, tirr, met, core, fsed, kzz):
+    """
+    Creates a robust cache signature by binning T_int to the nearest 50 K.
+    This prevents the pipeline from re-running models where T_int was 
+    modified post-run by the RCB Sniper physics correction.
+    """
+    try:
+        binned_tint = round(float(tint) / 50.0) * 50.0
+        return (
+            round(float(m), 4),
+            binned_tint,
+            round(float(tirr), 4),
+            round(float(met), 4),
+            round(float(core), 4),
+            round(float(fsed), 4),
+            round(float(kzz), 4)
+        )
+    except (TypeError, ValueError):
+        return None
+
 def run_model(target_params: dict) -> dict:
     try:
         import random
@@ -82,12 +112,24 @@ def run_model(target_params: dict) -> dict:
 # =============================================================================
 if __name__ == "__main__":
     
-    print(f"🎲 Generating {TOTAL_RANDOM_MODELS} random grid points (Seed: {RANDOM_SEED})...")
-    np.random.seed(RANDOM_SEED)
-    
     combinations = []
+
+    # --- Generate Regular Grid ---
+    regular_combinations = list(product(
+        REGULAR_GRID["mass"],
+        REGULAR_GRID["T_int"],
+        REGULAR_GRID["T_irr"],
+        REGULAR_GRID["Met"],
+        REGULAR_GRID["core_mass_earth"],
+        REGULAR_GRID["f_sed"],
+        REGULAR_GRID["kzz"]
+    ))
+    combinations.extend(regular_combinations)
+    print(f"📐 Generated {len(regular_combinations)} regular grid points.")
+    
+    # --- Generate Random Grid ---
+    print(f"🎲 Generating {TOTAL_RANDOM_MODELS}")    
     for _ in range(TOTAL_RANDOM_MODELS):
-        # Draw uniform random samples across all defined bounds
         m = np.random.uniform(*PARAM_BOUNDS["mass"])
         tint = np.random.uniform(*PARAM_BOUNDS["T_int"])
         tirr = np.random.uniform(*PARAM_BOUNDS["T_irr"])
@@ -99,7 +141,7 @@ if __name__ == "__main__":
         combinations.append((m, tint, tirr, met, core, fsed, kzz))
     
     # --- PRE-FLIGHT CACHE SCANNER ---
-    output_dir = Path(GRID_CONFIG["output_dir"])
+    output_dir = Path('./../' + GRID_CONFIG["output_dir"])
     completed_tasks = set()
     
     if output_dir.exists():
@@ -113,9 +155,11 @@ if __name__ == "__main__":
                 if status in ['converged', 'max_iterations_reached']:
                     
                     p = data.get('final_params', data.get('parameters', {}))
+                    
+                    # Try to get the dial first, fallback to the physical (sniper) T_int
                     target_tint = p.get('T_int_input_dial', p.get('T_int'))
                     
-                    task_tuple = (
+                    cache_key = get_cache_key(
                         p.get('mass'),
                         target_tint,
                         p.get('T_irr'),
@@ -125,11 +169,10 @@ if __name__ == "__main__":
                         p.get('kzz')
                     )
                     
-                    if all(v is not None for v in task_tuple):
-                        # Rounding to 4 decimals prevents random float precision errors
-                        rounded_tuple = tuple(round(float(v), 4) for v in task_tuple)
-                        completed_tasks.add(rounded_tuple)
+                    if cache_key is not None:
+                        completed_tasks.add(cache_key)
             except Exception:
+                print(f"⚠️ Warning: Could not read {pkl_file.name}. Skipping this file.")
                 continue
                 
         print(f"✅ Found {len(completed_tasks)} already completed models. They will be skipped.")
@@ -138,34 +181,33 @@ if __name__ == "__main__":
     # Build the specific dictionary for each grid point
     grid_tasks = []
     
-    for (m, tint, tirr, met, core, fsed, kzz) in combinations:
+    for combo in combinations:
         
-        current_tuple = (m, tint, tirr, met, core, fsed, kzz)
-        rounded_current = tuple(round(float(v), 4) for v in current_tuple)
+        # Check against the robust 50K-binned cache key
+        cache_key = get_cache_key(*combo)
         
-        # Check if this exact random point was already processed
-        if rounded_current in completed_tasks:
+        if cache_key in completed_tasks:
             continue  
             
         params = STATIC_PARAMS.copy()
         params.update({
-            "mass": m,
-            "T_int": tint,
-            "T_irr": tirr,
-            "Met": met,
-            "core_mass_earth": core,
-            "f_sed": fsed,
-            "kzz": kzz
+            "mass": combo[0],
+            "T_int": combo[1],
+            "T_irr": combo[2],
+            "Met": combo[3],
+            "core_mass_earth": combo[4],
+            "f_sed": combo[5],
+            "kzz": combo[6]
         })
         grid_tasks.append(params)
         
     total_models = len(grid_tasks)
     
     if total_models == 0:
-        print("🎉 All random grid combinations have already been successfully computed! Nothing to do.")
+        print("🎉 All grid combinations have already been successfully computed! Nothing to do.")
         exit(0)
         
-    print(f"🚀 INITIALIZING EXOWEAVE RANDOMIZED GRID COMPUTING...")
+    print(f"🚀 INITIALIZING EXOWEAVE COMBINED GRID COMPUTING...")
     print(f"📦 Remaining Models to Compute: {total_models}")
     print(f"💻 CPU Cores Detected: {os.cpu_count()}")
     print("-" * 60)
@@ -189,7 +231,6 @@ if __name__ == "__main__":
                 failed += 1
                 icon = "❌"
                 
-            # Formatting to 3 decimals so the terminal output isn't a mess of long floats
             print(f"[{i}/{total_models}] {icon} M={res['mass']:.3f} | "
                   f"T_int={res['T_int']:.1f} | Core={res['core']:.2f} | Status: {res['status']} "
                   f"(Iters: {res['iterations']})")

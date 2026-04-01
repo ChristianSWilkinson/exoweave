@@ -42,6 +42,7 @@ def repair_photometry_in_pkls(target_dir: str):
         # 1. Skip if atmosphere_raw is missing or empty
         raw_df = data.get('atmosphere_raw')
         if raw_df is None or raw_df.empty:
+            print(f"⚠️ Skipping {pkl_file.name} - 'atmosphere_raw' is missing or empty.")
             continue
             
         # 2. Skip if it already has valid photometry

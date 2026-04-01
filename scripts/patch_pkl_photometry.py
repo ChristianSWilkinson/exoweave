@@ -131,6 +131,7 @@ def patch_pkl_photometry(target_dir: str, target_filters: list = None, force_rec
                 updated_this_model = True
                 
             except Exception as e:
+                print(f"⚠️ Failed to process {filter_id} for {pkl_file.name}: {e}")
                 pass # Silently skip filters that fail to download or integrate
                 
         # 5. Safely save back to the .pkl file if changes were made

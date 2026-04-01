@@ -25,9 +25,9 @@ from exowrap.model import Simulation
 from exowrap.output import ExoremOut
 from exowrap.tools import upgrade_resolution
 from fuzzycore.constants import G_CONST, M_JUPITER, R_JUPITER
+import fuzzycore.constants as c
 from fuzzycore.solver import solve_structure
 from fuzzycore.utils import DummyLock, generate_gaussian_z_profile
-import fuzzycore.constants as c
 
 # Internal exoweave modules
 from .io import save_converged_model, save_failed_run, save_step_model
@@ -36,6 +36,7 @@ from .physics import (
     calculate_new_tint,
     calculate_stitched_mass,
     calculate_z_base,
+    calculate_entropy_evolution
 )
 from .profile import build_master_profile
 
@@ -535,7 +536,7 @@ class ExoCoupler:
             # --- E. HIGH-RES UPGRADE, PHOTOMETRY & STITCHING ---
             output_params = self.params.copy()
             output_params['T_int_input_dial'] = static_t_int
-            output_params['T_int'] = true_t_int 
+            output_params['T_int'] = true_t_int
             output_params['true_mass_Mjup'] = new_mass_kg / M_JUPITER
             output_params['p_link_bar'] = self.p_link_bar
             
@@ -569,6 +570,10 @@ class ExoCoupler:
 
             step_profile = build_master_profile(atm_out, int_results, p_link)
             photometry_section = calculate_comprehensive_photometry(atm_out)
+            logging.info("📸 Photometry calculated across all available bands.")
+
+            cooling_metrics = calculate_entropy_evolution(int_results, true_t_int)
+            logging.info("❄️ Cooling metrics calculated based on interior entropy evolution.")
 
             step_data = {
                 'status': 'intermediate',
@@ -580,9 +585,11 @@ class ExoCoupler:
                 'profile': step_profile,
                 'atmosphere_raw': raw_atm_df,
                 'interior_raw': int_results,
-                'photometry': photometry_section
+                'photometry': photometry_section,
+                'cooling_metrics': cooling_metrics
             }
             save_step_model(step_data, self.output_dir)
+            logging.info(f"💾 Intermediate model for iteration {iteration} saved successfully.")
             
             # --- F. CHECK CONVERGENCE & SAVE FINAL ---
             if abs(mass_error) < self.mass_tol:
@@ -595,7 +602,8 @@ class ExoCoupler:
                     'stitched_profile': step_profile, 
                     'atmosphere_raw': raw_atm_df,  
                     'interior_raw': int_results,
-                    'photometry': photometry_section
+                    'photometry': photometry_section,
+                    'cooling_metrics': cooling_metrics
                 }
                 
                 save_converged_model(converged_results, self.output_dir)
