@@ -22,29 +22,50 @@ def calculate_new_tint(
     fallback_t_int: float = np.nan
 ) -> float:
     """
-    Calculates the true Intrinsic Temperature (T_int) by isolating the internal 
-    radiosity exactly at the deep Radiative-Convective Boundary (RCB), avoiding 
-    both convective drop-offs below and stellar contamination above.
-    """
-    logging.debug("Extracting true T_int strictly at the deep RCB...")
+    Calculates the true Intrinsic Temperature (T_int) using a hybrid approach.
     
+    PRIMARY: Enforces global energy conservation at the Top of the Atmosphere (TOA).
+             Ideal for brown dwarfs and isolated/low-irradiation planets.
+    SECONDARY: If the planet is heavily irradiated (T_irr >= T_eff), the TOA signal 
+               is washed out. Falls back to extracting the internal radiosity exactly 
+               above the deep Radiative-Convective Boundary (RCB).
+    """
     try:
+        # ==========================================
+        # METHOD 1: TOA Energy Balance
+        # ==========================================
+        t_eff = atm_out.t_eff
+        t_irr = atm_out.t_irr
+        
+        f_eff_scaled = t_eff ** 4
+        f_irr_scaled = t_irr ** 4
+        f_int_scaled = f_eff_scaled - f_irr_scaled
+        
+        if f_int_scaled > 0:
+            true_t_int = float(f_int_scaled ** 0.25)
+            logging.debug(f"TOA Energy Balance: T_eff={t_eff:.1f}K, T_irr={t_irr:.1f}K -> T_int={true_t_int:.1f}K")
+            return true_t_int
+            
+        logging.info(f"🛡️ Irradiation dominated (T_irr {t_irr:.1f}K >= T_eff {t_eff:.1f}K). Falling back to Deep RCB Extractor.")
+        
+        # ==========================================
+        # METHOD 2: Deep RCB Extractor (Hot Jupiter Fallback)
+        # ==========================================
         df = atm_out.df
         p_bar = np.asarray(df['/outputs/levels/pressure'].iloc[0]) / 1e5
         rad_int = np.asarray(df['/outputs/levels/radiosity_internal'].iloc[0])
         is_conv = np.asarray(df['/outputs/levels/is_convective'].iloc[0])
         
-        # --- 1. Direction-Agnostic Scan for the True Deep RCB ---
         n_layers = len(is_conv)
         clear_space = 3
         p_rcb = np.nan
         
-        # Check if the deep atmosphere is ALREADY purely radiative (highly irradiated limit)
+        # Check if already purely radiative (extreme Hot Jupiter scenario)
         p_mask = p_bar >= pressure_threshold_bar
         if np.any(p_mask) and np.all(is_conv[p_mask] == 0):
             p_rcb = np.max(p_bar[p_mask])
         else:
-            # Find the physical bottom of the grid and the direction of "Up"
+            # Find the bottom and scan up
             bottom_idx = np.argmax(p_bar)
             step = 1 if bottom_idx == 0 else -1
             idx = bottom_idx
@@ -52,52 +73,50 @@ def calculate_new_tint(
             def is_valid(i): return 0 <= i < n_layers
             
             while is_valid(idx):
-                # Skip artificial radiative boundary layers at the very bottom
                 while is_valid(idx) and is_conv[idx] == 0: idx += step
                 if not is_valid(idx): break
-                
-                # Move up through the deep convective zone
                 while is_valid(idx) and is_conv[idx] == 1: idx += step
                 if not is_valid(idx): break
                     
-                # Check for a "clear space" of radiative layers to avoid getting snagged on blips
                 if step == 1:
                     block = is_conv[idx : min(idx + clear_space, n_layers)]
                 else:
                     block = is_conv[max(0, idx - clear_space + 1) : idx + 1]
                     
                 if np.all(block == 0):
-                    p_rcb = p_bar[idx - step] # The last convective layer
+                    p_rcb = p_bar[idx - step] 
                     break
                 else:
-                    pass # Just a blip, keep scanning upward
-        
-        # --- 2. Extract Flux exactly at the RCB ---
+                    pass
+                    
+        # Extract flux 1-2 levels ABOVE the RCB
         if not np.isnan(p_rcb):
             idx_rcb = np.argmin(np.abs(p_bar - p_rcb))
             
-            # Average the 3 layers immediately above the RCB in the radiative zone
+            # Start extraction safely above the convective boundary
+            safe_start = idx_rcb + step 
+            
             if step == 1:
-                slice_indices = list(range(idx_rcb, min(idx_rcb + 3, n_layers)))
+                slice_indices = list(range(safe_start, min(safe_start + 2, n_layers)))
             else:
-                slice_indices = list(range(max(0, idx_rcb - 2), idx_rcb + 1))
+                slice_indices = list(range(max(0, safe_start - 1), safe_start + 1))
+                
+            if not slice_indices:
+                slice_indices = [0 if step == -1 else n_layers - 1]
             
             rcb_flux = np.nanmean(rad_int[slice_indices])
             
-            # --- 3. Calculate T_int (with QC for non-converged negative fluxes) ---
             if rcb_flux > 0:
-                t_int_rcb = (rcb_flux / SIGMA_SB) ** 0.25
-                logging.debug(f"Found true T_int = {t_int_rcb:.2f} K at {p_rcb:.2f} bar.")
-                return float(t_int_rcb)
+                fallback_t_int_calculated = (rcb_flux / SIGMA_SB) ** 0.25
+                logging.debug(f"Deep RCB Extractor: Found T_int = {fallback_t_int_calculated:.2f}K at {p_bar[safe_start]:.2f} bar.")
+                return float(fallback_t_int_calculated)
             else:
-                logging.warning(f"⚠️ RCB flux is negative or zero ({rcb_flux:.2f} W/m^2). "
-                                f"Likely a non-converged deep profile.")
+                logging.warning(f"⚠️ Deep RCB flux is negative or zero ({rcb_flux:.2f} W/m^2).")
 
-        # Fallback if fully corrupted or unable to locate boundary
         return fallback_t_int
 
     except Exception as e:
-        logging.error(f"⚠️ Error verifying T_int at RCB: {e}. Falling back to dial value.")
+        logging.error(f"⚠️ Error in hybrid T_int calculation: {e}. Falling back to dial value.")
         return fallback_t_int
 
 
@@ -286,11 +305,11 @@ TARGET_FILTERS = [
     "Paranal/SPHERE.IRDIS_D_K12_1", "Paranal/SPHERE.IRDIS_D_K12_2",
     "Paranal/NACO.J", "Paranal/NACO.H", "Paranal/NACO.Ks", "Paranal/NACO.Lp", "Paranal/NACO.Mp",
     "Paranal/HAWKI.J", "Paranal/HAWKI.H", "Paranal/HAWKI.Ks", "Paranal/HAWKI.CH4",
-    "Paranal/VISIR.B8_7", "Paranal/VISIR.B10_7", "Paranal/VISIR.B11_7", "Paranal/VISIR.Q2",
+    "Paranal/VISIR.B87", "Paranal/VISIR.SIV", "Paranal/VISIR.PAH2",
     
     # --- KECK & GEMINI ---
     "Keck/NIRC2.J", "Keck/NIRC2.H", "Keck/NIRC2.Ks", "Keck/NIRC2.Kp", "Keck/NIRC2.Lp", "Keck/NIRC2.Ms",
-    "Gemini/NIRI.J", "Gemini/NIRI.H", "Gemini/NIRI.K", "Gemini/NIRI.L-prime", "Gemini/NIRI.M-prime",
+    "Gemini/NIRI.J-G0202w","Gemini/NIRI.H-G0203w","Gemini/NIRI.K-G0204w","Gemini/NIRI.Lprime-G0207w","Gemini/NIRI.Mprime-G0208w",
     
     # --- SPACE: HST, SPITZER, WISE ---
     "HST/WFC3_IR.F110W", "HST/WFC3_IR.F140W", "HST/WFC3_IR.F160W", "HST/WFC3_UVIS1.F606W", "HST/WFC3_UVIS1.F814W",
@@ -306,7 +325,20 @@ TARGET_FILTERS = [
     "SLOAN/SDSS.u", "SLOAN/SDSS.g", "SLOAN/SDSS.r", "SLOAN/SDSS.i", "SLOAN/SDSS.z",
     "PAN-STARRS/PS1.g", "PAN-STARRS/PS1.r", "PAN-STARRS/PS1.i", "PAN-STARRS/PS1.z", "PAN-STARRS/PS1.y",
     "GAIA/GAIA3.G", "GAIA/GAIA3.Gbp", "GAIA/GAIA3.Grp",
-    "TESS/TESS.Red", "Kepler/Kepler.K"
+    "TESS/TESS.Red", "Kepler/Kepler.K",
+
+    "UKIRT/WFCAM.Z", "UKIRT/WFCAM.Y", "UKIRT/WFCAM.J", "UKIRT/WFCAM.H", "UKIRT/WFCAM.K",
+    "Paranal/VISTA.Z", "Paranal/VISTA.Y", "Paranal/VISTA.J", "Paranal/VISTA.H", "Paranal/VISTA.Ks",
+    "Generic/Bessell.U", "Generic/Bessell.B", "Generic/Bessell.V", "Generic/Bessell.R", "Generic/Bessell.I",
+
+    # --- MKO (NSFCam & MIRSI) ---
+    "MKO/NSFCam.J", "MKO/NSFCam.H", "MKO/NSFCam.K", "MKO/NSFCam.Kp", "MKO/NSFCam.Ks", 
+    "MKO/NSFCam.Lp", "MKO/NSFCam.Mp",
+    "MKO/MIRSI.K", "MKO/MIRSI.4_9", "MKO/MIRSI.7_7", "MKO/MIRSI.8_7", "MKO/MIRSI.9_7", 
+    "MKO/MIRSI.N", "MKO/MIRSI.11_7", "MKO/MIRSI.12_282", "MKO/MIRSI.12_33", 
+    "MKO/MIRSI.18", "MKO/MIRSI.20", "MKO/MIRSI.24",
+
+
 ]
 
 # Physical file shared by all CPU cores
@@ -367,9 +399,9 @@ def calculate_comprehensive_photometry(atm_out) -> dict:
             if np.sum(interp_trans) == 0:
                 continue
 
-            eff_wav = np.trapz(interp_trans * exo_wl, exo_wl) / np.trapz(interp_trans, exo_wl)
-            numerator = np.trapz(exo_flux * interp_trans * exo_wl, exo_wl)
-            denominator = np.trapz(interp_trans * exo_wl, exo_wl)
+            eff_wav = np.trapezoid(interp_trans * exo_wl, exo_wl) / np.trapz(interp_trans, exo_wl)
+            numerator = np.trapezoid(exo_flux * interp_trans * exo_wl, exo_wl)
+            denominator = np.trapezoid(interp_trans * exo_wl, exo_wl)
 
             phot_flux_flambda = numerator / denominator
             c_um_s = 299792458.0 * 1e6

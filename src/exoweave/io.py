@@ -13,13 +13,24 @@ def _generate_filename(params: dict, actual_mass: float = None, suffix: str = ""
     t_int = params.get('T_int', 0.0)
     met = params.get('Met', 0.0)
     core = params.get('core_mass_earth', 0.0)
-    fsed = params.get('f_sed', 0.0)
+    
+    # --- NEW: Safely handle dictionary f_sed values ---
+    fsed_raw = params.get('f_sed', 0.0)
+    if isinstance(fsed_raw, dict):
+        fsed_ref = float(fsed_raw.get('Fe', 6.0))
+        fsed_vol = float(fsed_raw.get('H2O', 6.0))
+    else:
+        # Fallback for older models where f_sed is just a single float
+        fsed_ref = float(fsed_raw)
+        fsed_vol = float(fsed_raw)
+
     kzz = params.get('kzz', 0.0)
     sigma = params.get('sigma_val', 0.0)
     
-    # Format: M_1.000_Tirr_100.0_Tint_500.0_Met_0.00_Core_15.0_fsed_1.0_kzz_8.0_sigma_0.05
+    # Format: M_1.000_Tirr_100.0_Tint_500.0_Met_0.00_Core_15.0_fsedR_1.0_fsedV_5.0_kzz_8.0_sigma_0.05
     base = (f"M_{mass:.3f}_Tirr_{t_irr:.1f}_Tint_{t_int:.1f}_"
-            f"Met_{met:.2f}_Core_{core:.1f}_fsed_{fsed:.1f}_kzz_{kzz:.1f}_sigma_{sigma:.2f}")
+            f"Met_{met:.2f}_Core_{core:.1f}_fsedR_{fsed_ref:.1f}_fsedV_{fsed_vol:.1f}_"
+            f"kzz_{kzz:.1f}_sigma_{sigma:.2f}")
     
     if suffix:
         return f"{base}_{suffix}.pkl"

@@ -8,11 +8,15 @@ from exoweave.physics import calculate_comprehensive_photometry
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-def repair_photometry_in_pkls(target_dir: str):
+def repair_photometry_in_pkls(target_dir: str, force_recalculate: bool = False):
     """
-    Scans for .pkl files missing 'photometry' in both 'target' and 'steps' 
-    directories, reconstructs the ExoREM output from 'atmosphere_raw', 
-    calculates the missing photometry, and occasionally prints sanity checks.
+    Scans for .pkl files in both 'target' and 'steps' directories, 
+    reconstructs the ExoREM output from 'atmosphere_raw', and calculates 
+    the photometry.
+    
+    Args:
+        target_dir: The root directory containing 'target' and 'steps'.
+        force_recalculate: If True, overwrites existing photometry. If False, skips files that already have it.
     """
     pkl_dir = Path(target_dir)
     if not pkl_dir.exists():
@@ -28,7 +32,8 @@ def repair_photometry_in_pkls(target_dir: str):
         logging.warning(f"⚠️ No files found in {pkl_dir}/target/ or {pkl_dir}/steps/")
         return
 
-    logging.info(f"🔍 Scanning {len(target_files)} target and {len(step_files)} step files for missing photometry...")
+    mode_msg = "FORCING RECALCULATION on all files" if force_recalculate else "Scanning for MISSING photometry"
+    logging.info(f"🔍 {mode_msg} across {len(target_files)} target and {len(step_files)} step files...")
     models_repaired = 0
 
     for idx, pkl_file in enumerate(pkl_files):
@@ -42,13 +47,14 @@ def repair_photometry_in_pkls(target_dir: str):
         # 1. Skip if atmosphere_raw is missing or empty
         raw_df = data.get('atmosphere_raw')
         if raw_df is None or raw_df.empty:
-            print(f"⚠️ Skipping {pkl_file.name} - 'atmosphere_raw' is missing or empty.")
+            logging.warning(f"⚠️ Skipping {pkl_file.name} - 'atmosphere_raw' is missing or empty.")
             continue
             
-        # 2. Skip if it already has valid photometry
-        if 'photometry' in data and data['photometry']:
-            if 'bands' in data['photometry'] and len(data['photometry']['bands']) > 0:
-                continue
+        # 2. Check if we should skip based on existing photometry
+        if not force_recalculate:
+            if 'photometry' in data and data['photometry']:
+                if 'bands' in data['photometry'] and len(data['photometry']['bands']) > 0:
+                    continue
 
         try:
             # 3. Re-instantiate the ExoremOut object using the raw DataFrame
@@ -90,18 +96,19 @@ def repair_photometry_in_pkls(target_dir: str):
                     logging.info(f"   -> {key: <25} | {flux_w:.3e} W/m²/µm  |  {flux_jy:.3e} Jy")
                 logging.info("-" * 60)
             # =========================================================
-            
+            logging.info(f"✅ Processed photometry for {pkl_file.name}")
         except Exception as e:
             logging.error(f"❌ Failed to repair {pkl_file.name}: {e}")
             if 'temp_file' in locals() and temp_file.exists():
                 temp_file.unlink() # Clean up temp file on failure
 
-    logging.info(f"\n✅ Successfully repaired photometry for {models_repaired} .pkl files across 'target' and 'steps'!")
+    logging.info(f"\n✅ Successfully processed photometry for {models_repaired} .pkl files across 'target' and 'steps'!")
     logging.info("🚀 You can now run `compile_grid.py` to seamlessly rebuild your HDF5 and CSV catalogs.")
 
 if __name__ == "__main__":
     
     # Point this to your main output directory
-    GRID_OUTPUT_DIR = "../outputs/grid_run"
+    GRID_OUTPUT_DIR = "../outputs/grid_run_5clouds"
     
-    repair_photometry_in_pkls(target_dir=GRID_OUTPUT_DIR)
+    # Set force_recalculate=True to overwrite all existing photometry
+    repair_photometry_in_pkls(target_dir=GRID_OUTPUT_DIR, force_recalculate=False) 

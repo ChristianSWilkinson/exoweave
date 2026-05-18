@@ -69,6 +69,14 @@ class ExoCoupler:
         self.tmp_dir = EXOWEAVE_ROOT / "tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.tmp_dir / f"solver_steps_{os.getpid()}.csv"
+
+        # --- Prior Directory Setup ---
+        raw_prior_dir = config.get("prior_dir")
+        if raw_prior_dir:
+            p_path = Path(raw_prior_dir)
+            self.prior_dir = EXOWEAVE_ROOT / p_path if not p_path.is_absolute() else p_path
+        else:
+            self.prior_dir = None
         
         # --- Convergence Settings ---
         self.max_iterations = config.get("max_iterations", 15)
@@ -76,6 +84,22 @@ class ExoCoupler:
         self.p_bottom_bar = config.get("p_bottom_bar", 1000.0) 
         self.p_link_bar = config.get("p_link_target_bar", self.p_bottom_bar)
         self.min_p_link_bar = config.get("min_p_link_bar", 0.1)
+        
+        # --- Forward ExoREM convergence settings to exowrap ---
+        retrieval_keys = [
+            "retrieval_level_bottom", "retrieval_level_top",
+            "retrieval_flux_error_bottom", "retrieval_flux_error_top",
+            "n_iterations", "n_non_adiabatic_iterations",
+            "chemistry_iteration_interval", "cloud_iteration_interval",
+            "n_burn_iterations", "retrieval_tolerance",
+            "smoothing_bottom", "smoothing_top", "weight_apriori"
+        ]
+        for key in retrieval_keys:
+            if key in config:
+                self.params[key] = config[key]
+
+        # Forward the terminal output toggle
+        self.params["show_fortran_output"] = config.get("show_fortran_output", False)
         
         self.history = {
             'iteration': [], 
@@ -128,13 +152,20 @@ class ExoCoupler:
             z_core=z_guess
         )
         
-        # Dynamic starting guess to prevent Gas Giant roots for Sub-Neptunes
-        mass_mj = self.params['mass']
-        if mass_mj < 0.05: log_pc_guess = 6.8  # < 15 Earth masses
-        elif mass_mj < 0.1: log_pc_guess = 7.5 # 15 - 30 Earth masses
-        elif mass_mj < 0.5: log_pc_guess = 8.5 # Saturns
-        elif mass_mj <= 2.0: log_pc_guess = 9.5 # Jupiters
-        else: log_pc_guess = 10.5 # Super-Jupiters
+        # --- 2. DYNAMIC STARTING GUESS ---
+        # Prioritize user input, fallback to empirical mass scaling
+        log_pc_guess = self.params.get('initial_log_pc')
+        
+        if log_pc_guess is None:
+            mass_mj = self.params['mass']
+            if mass_mj < 0.05: log_pc_guess = 6.8  # < 15 Earth masses
+            elif mass_mj < 0.1: log_pc_guess = 7.5 # 15 - 30 Earth masses
+            elif mass_mj < 0.5: log_pc_guess = 8.5 # Saturns
+            elif mass_mj <= 2.0: log_pc_guess = 9.5 # Jupiters
+            else: log_pc_guess = 10.5 # Super-Jupiters
+            
+        # Save it into params so the main solver loop inherits this starting point!
+        self.params['initial_log_pc'] = log_pc_guess
 
         fc_params = {
             'P_surf': p_surf_pa,
@@ -142,10 +173,10 @@ class ExoCoupler:
             'M_core': self.params.get('core_mass_earth', 10.0) * c.M_EARTH, 
             'M_water':  self.params.get('M_water', 0.0) * c.M_EARTH, 
             'iron_fraction': self.params.get('iron_fraction', 0.33),
-            'z_base': z_guess,                        # <--- NOW DYNAMIC
+            'z_base': z_guess,
             'Y_ratio': 0.26,                          
             'sigma_val': 0.0,  
-            'z_profile': z_profile,                   # <--- NOW DYNAMIC
+            'z_profile': z_profile,
             'initial_log_pc': log_pc_guess,                      
             'debug': self.params.get('debug', False)    
         }
@@ -157,9 +188,7 @@ class ExoCoupler:
             target_val=target_mass_kg,
             params=fc_params,
             mode='mass',                              
-            trial_id="bootstrap",
-            csv_file=os.devnull,
-            write_lock=DummyLock()
+            trial_id="bootstrap"
         )
         
         if int_results is None:
@@ -266,49 +295,64 @@ class ExoCoupler:
     
     def _find_closest_prior_profile(self, init_pt_file: Path) -> bool:
         """
-        Scans the output directory for previously saved models to use as a 
-        warm-started prior, drastically reducing the initial iteration time.
-        
-        Args:
-            init_pt_file (Path): Destination to write the prior P-T profile.
-            
-        Returns:
-            bool: True if a valid prior was found and written, False otherwise.
+        Scans the output directory (and an optional prior directory) for 
+        previously saved models to use as a warm-started prior.
         """
         best_file = None
         best_distance = float('inf')
         threshold = 0.30  
         
-        for pkl_path in self.output_dir.glob("**/*.pkl"):
-            try:
-                with open(pkl_path, 'rb') as f:
-                    data = pickle.load(f)
+        # Scan both the current output directory AND the historical prior directory
+        search_dirs = [self.output_dir]
+        if self.prior_dir and self.prior_dir.exists():
+            search_dirs.append(self.prior_dir)
+            
+        for s_dir in search_dirs:
+            for pkl_path in s_dir.glob("**/*.pkl"):
+                try:
+                    with open(pkl_path, 'rb') as f:
+                        data = pickle.load(f)
+                        
+                    if 'parameters' not in data or 'profile' not in data:
+                        continue
+                        
+                    saved = data['parameters']
                     
-                if 'parameters' not in data or 'profile' not in data:
+                    m_diff = abs(saved.get('mass', 1.0) - self.params['mass']) / self.params['mass']
+                    t_int_diff = abs(saved.get('T_int', 500) - self.params['T_int']) / max(self.params['T_int'], 1)
+                    t_irr_diff = abs(saved.get('T_irr', 500) - self.params.get('T_irr', 500)) / max(self.params.get('T_irr', 500), 1)
+                    met_diff = abs(saved.get('Met', 0.0) - self.params.get('Met', 0.0))
+                    sigma_diff = abs(saved.get('sigma_val', 0.0) - self.params.get('sigma_val', 0.0))
+                    
+                    # --- NEW: WEIGHTED DISTANCE CALCULATION ---
+                    # Priority is given to fundamental structural parameters.
+                    # Weights sum to 5.0 to maintain the threshold scale.
+                    w_mass = 2.5   # 50% Importance
+                    w_tint = 1.5   # 30% Importance
+                    w_tirr = 0.6   # 12% Importance
+                    w_met = 0.2    # 4% Importance
+                    w_sigma = 0.2  # 4% Importance
+                    
+                    dist = np.sqrt(
+                        (w_mass * (m_diff**2)) + 
+                        (w_tint * (t_int_diff**2)) + 
+                        (w_tirr * (t_irr_diff**2)) + 
+                        (w_met * (met_diff**2)) + 
+                        (w_sigma * (sigma_diff**2))
+                    )
+                    
+                    if dist < best_distance and dist < threshold:
+                        best_distance = dist
+                        best_file = pkl_path
+                        best_data = data
+                        
+                except Exception:
                     continue
-                    
-                saved = data['parameters']
-                
-                m_diff = abs(saved.get('mass', 1.0) - self.params['mass']) / self.params['mass']
-                t_int_diff = abs(saved.get('T_int', 500) - self.params['T_int']) / max(self.params['T_int'], 1)
-                t_irr_diff = abs(saved.get('T_irr', 500) - self.params.get('T_irr', 500)) / max(self.params.get('T_irr', 500), 1)
-                met_diff = abs(saved.get('Met', 0.0) - self.params.get('Met', 0.0))
-                sigma_diff = abs(saved.get('sigma_val', 0.0) - self.params.get('sigma_val', 0.0))
-                
-                dist = np.sqrt(m_diff**2 + t_int_diff**2 + t_irr_diff**2 + met_diff**2 + sigma_diff**2)
-                
-                if dist < best_distance and dist < threshold:
-                    best_distance = dist
-                    best_file = pkl_path
-                    best_data = data
-                    
-            except Exception:
-                continue
                 
         if best_file is not None:
             logging.info(
                 f"🧠 Smart Prior: Found neighbor model ({best_file.name}) "
-                f"with parameter distance {best_distance:.2f}"
+                f"with weighted parameter distance {best_distance:.2f}"
             )
             df = best_data['profile']
             p_pa = df['Pressure_bar'].values * 1e5
@@ -483,6 +527,9 @@ class ExoCoupler:
             ), 3)
 
             # --- C. RUN INTERIOR (FUZZYCORE) ---
+            # Fetch the warm-started logPc (or the bootstrap guess)
+            current_log_pc = self.params.get('initial_log_pc', 9.0)
+
             fc_params = {
                 'P_surf': p_link,
                 'T_surf': t_link,
@@ -494,7 +541,7 @@ class ExoCoupler:
                 'Y_ratio': y_ratio,                          
                 'sigma_val': sigma_val,
                 'z_profile': z_profile,
-                'initial_log_pc': 9.0,                      
+                'initial_log_pc': current_log_pc,
                 'debug': self.params.get('debug', False)     
             }
             
@@ -502,9 +549,7 @@ class ExoCoupler:
                 target_val=current_g,
                 params=fc_params,
                 mode='gravity',                              
-                trial_id=f"iter_{iteration}",
-                csv_file=str(self.csv_path),
-                write_lock=DummyLock()
+                trial_id=f"iter_{iteration}"
             )
             
             if int_results is None:
@@ -533,12 +578,23 @@ class ExoCoupler:
             logging.info(f"📊 Results: Total Calc Mass = {new_mass_kg / M_JUPITER:.3f} M_Jup (Error: {mass_error:.2%})")
             logging.info(f"📊 Results: True Measured T_int = {true_t_int:.1f} K (Input dial: {static_t_int} K)")
 
+            # --- WARM START THE INTERIOR FOR THE NEXT ITERATION ---
+            # Extract the highest pressure from the interior profile (central pressure)
+            try:
+                # fuzzycore already returns the array natively in logPc!
+                converged_log_pc = float(np.max(int_results['P']))
+                self.params['initial_log_pc'] = converged_log_pc
+                logging.info(f"💾 Interior Warm-Start: Next iteration will begin at logPc = {converged_log_pc:.3f}")
+            except Exception as e:
+                logging.warning(f"⚠️ Could not extract central pressure for warm-start: {e}")
+
             # --- E. HIGH-RES UPGRADE, PHOTOMETRY & STITCHING ---
             output_params = self.params.copy()
             output_params['T_int_input_dial'] = static_t_int
             output_params['T_int'] = true_t_int
             output_params['true_mass_Mjup'] = new_mass_kg / M_JUPITER
             output_params['p_link_bar'] = self.p_link_bar
+            output_params['T_eff'] = atm_out.t_eff
             
             target_res = self.config.get('target_resolution', None)
             current_res = self.config.get('resolution', 50)

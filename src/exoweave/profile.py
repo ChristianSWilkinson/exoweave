@@ -33,6 +33,7 @@ def build_master_profile(atm_out: ExoremOut, int_results: dict, p_link_bar: floa
     # Levels (Boundaries)
     p_atm_lvl = atm_out.pressure_levels
     alt_atm_lvl = atm_out.altitude_profile
+    t_atm_lvl = atm_out.temperature_levels
     
     # Layers (Cell Centers)
     p_atm_lay = atm_out.pressure_profile
@@ -87,7 +88,7 @@ def build_master_profile(atm_out: ExoremOut, int_results: dict, p_link_bar: floa
     # 5. THERMODYNAMIC INTERPOLATION
     # ==========================================
     # Create interpolators mapping log(P) to the target variables
-    atm_t_interp = interp1d(np.log10(p_atm_lay), t_atm_lay, fill_value="extrapolate")
+    atm_t_interp = interp1d(np.log10(p_atm_lvl), t_atm_lvl, fill_value="extrapolate")
     int_t_interp = interp1d(np.log10(p_int_pa), t_int, fill_value="extrapolate")
     
     atm_g_interp = interp1d(np.log10(p_atm_lay), g_atm_lay, fill_value="extrapolate")
