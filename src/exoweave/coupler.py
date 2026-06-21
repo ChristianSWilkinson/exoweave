@@ -12,6 +12,7 @@ import os
 import pickle
 import shutil
 import uuid
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -57,6 +58,24 @@ class ExoCoupler:
         self.params = target_params.copy()
         self.config = config
         
+        # =====================================================================
+        # --- NEW: PROTECT AGAINST IMPOSSIBLE LHS DRAWS ---
+        # =====================================================================
+        # Convert target planet mass to Earth masses (1 M_Jup ~ 317.8 M_Earth)
+        total_mass_earth = self.params['mass'] * (M_JUPITER / c.M_EARTH)
+        req_core_earth = self.params.get('core_mass_earth', 10.0)
+
+        # Cap the core mass at 90% of the total mass to guarantee a gas envelope exists
+        if req_core_earth > (total_mass_earth * 0.99):
+            capped_core = total_mass_earth * 0.99
+            logging.warning(
+                f"⚠️ Impossible LHS Draw: Requested Core ({req_core_earth:.1f} M_E) "
+                f"exceeds 90% of Total Planet Mass ({total_mass_earth:.1f} M_E). "
+                f"Clamping core to {capped_core:.1f} M_E."
+            )
+            self.params['core_mass_earth'] = capped_core
+        # =====================================================================
+
         # --- Output Directory Setup ---
         raw_out_dir = config.get("output_dir", "exoweave_outputs")
         out_path = Path(raw_out_dir)
@@ -464,6 +483,8 @@ class ExoCoupler:
         # ITERATIVE ROOT-FINDING LOOP
         # ==========================================
         for iteration in range(1, self.max_iterations + 1):
+            iter_start_time = time.time()
+
             current_g = self.params['g_1bar']
             static_t_int = self.params['T_int']
             
@@ -493,11 +514,16 @@ class ExoCoupler:
                 logging.info(f"🔥 Warm Start: Injecting P-T profile from iteration {iteration - 1}")
 
             # --- A. RUN ATMOSPHERE (EXOWRAP) ---
+            atm_start_time = time.time()
+
             atm_sim = Simulation(
                 params=self.params, 
                 resolution=self.config.get('resolution', 50)
             )
             raw_atm_df = atm_sim.run()
+
+            atm_end_time = time.time()
+            logging.info(f"⏳ Atmosphere (ExoREM) solved in {atm_end_time - atm_start_time:.2f} seconds.")
             
             if raw_atm_df.empty:
                 logging.error("❌ exowrap failed to return data.")
@@ -544,6 +570,8 @@ class ExoCoupler:
                 'initial_log_pc': current_log_pc,
                 'debug': self.params.get('debug', False)     
             }
+
+            int_start_time = time.time()
             
             int_results = solve_structure(
                 target_val=current_g,
@@ -551,6 +579,9 @@ class ExoCoupler:
                 mode='gravity',                              
                 trial_id=f"iter_{iteration}"
             )
+
+            int_end_time = time.time()
+            logging.info(f"⏳ Interior (FuzzyCore) solved in {int_end_time - int_start_time:.2f} seconds.")
             
             if int_results is None:
                 logging.error("❌ fuzzycore solver failed to converge on an internal structure.")
@@ -649,6 +680,8 @@ class ExoCoupler:
             
             # --- F. CHECK CONVERGENCE & SAVE FINAL ---
             if abs(mass_error) < self.mass_tol:
+                iter_end_time = time.time()
+                logging.info(f"⏳ Iteration {iteration} completed in {iter_end_time - iter_start_time:.2f} seconds.")  # <--- ADD THIS
                 logging.info(f"✅ CONVERGED in {iteration} iterations!")
                 
                 converged_results = {
@@ -695,6 +728,9 @@ class ExoCoupler:
                 next_g = 1.5
 
             self.params['g_1bar'] = next_g
+
+            iter_end_time = time.time()  
+            logging.info(f"⏳ Iteration {iteration} completed in {iter_end_time - iter_start_time:.2f} seconds.")
 
         # ==========================================
         # FAILURE HANDLING

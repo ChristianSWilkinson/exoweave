@@ -35,3 +35,7 @@ test_run.csv
 
 # Readme generator
 generate_readme.py
+
+# Grid output logs
+*.err
+*.out

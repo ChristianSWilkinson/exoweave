@@ -19,6 +19,7 @@ import numpy as np
 # Import ExoWeave
 from exoweave.coupler import ExoCoupler
 from fuzzycore import constants as c
+from fuzzycore.constants import G_CONST, M_EARTH, R_EARTH, M_JUPITER
 
 # =============================================================================
 # 1. DEFINE YOUR PARAMETER ARRAYS
@@ -64,22 +65,22 @@ def run_coupled_model(task_kwargs):
     
     # Create a completely unique output directory for this specific run
     # This prevents Fortran file I/O collisions!
-    run_dir = f"./outputs/slurm_grid/Tint_{int(t_int)}/w_{m_water:.1f}_s_{sigma:.3f}"
+    run_dir = f"./outputs/subneptunes/Tint_{int(t_int)}/w_{m_water:.1f}_s_{sigma:.3f}"
     
     run_params = {
         "mass": TARGET_MASS_MJUP,
-        "T_irr": 550.0,              
-        "T_int": t_int,                 
-        "Met": 1.0,                  
-        "core_mass_earth": m_core,      
-        "M_water": m_water,             
+        "T_irr": 550.0,
+        "T_int": t_int,
+        "Met": 1.0,
+        "core_mass_earth": m_core,
+        "M_water": m_water,
         "sigma_val": sigma,
-        "iron_fraction": 0.33,       
+        "iron_fraction": 0.33,
         "f_sed": 3.0,
         "kzz": 8.0,
-        "g_1bar": 10.0,
+        "g_1bar": task_kwargs['g_init'],
         "initial_log_pc": 6.0,
-        "debug": False 
+        "debug": False
     }
 
     run_config = GLOBAL_CONFIG.copy()
@@ -101,21 +102,32 @@ def run_coupled_model(task_kwargs):
 # =============================================================================
 if __name__ == "__main__":
     # Dynamically grab the number of CPUs allocated by SLURM. Fallback to 4.
-    num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", 4))
+    num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", 24))
     print(f"🚀 Initializing Grid Run across {num_cpus} CPU cores...")
 
     print("📚 Loading waterworld_atlas.csv to validate M_core parameters...")
     try:
-        atlas_df = pd.read_csv("waterworld_atlas.csv")
+        atlas_df = pd.read_csv("../../fuzzycore/data/waterworld_atlas.csv")
         ok_df = atlas_df[atlas_df['Status'] == 'ok']
     except FileNotFoundError:
         print("❌ Error: waterworld_atlas.csv not found in the working directory.")
         sys.exit(1)
 
+    # Target radius and tolerance for atlas-point filtering
+    R_TARGET_RE = 2.75
+    R_TOLERANCE = 1.00  # widen if too few points survive
+
+    # Filter the atlas to converged points near the target radius FIRST
+    viable = ok_df[np.abs(ok_df['R_total_Re'] - R_TARGET_RE) < R_TOLERANCE].copy()
+    if len(viable) == 0:
+        raise ValueError("No atlas points within R tolerance — widen R_TOLERANCE.")
+
+    print(f"📍 Atlas filtered to {len(viable)} viable points near R={R_TARGET_RE} R_E")
+
     # Build the task list
     tasks = []
-    max_w = ok_df['M_water_Me'].max() or 1.0
-    max_s = ok_df['Sigma'].max() or 1.0
+    max_w = viable['M_water_Me'].max() or 1.0
+    max_s = viable['Sigma'].max() or 1.0
 
     for t, w, s in itertools.product(T_INT_TARGETS, M_WATER_TARGETS, SIGMA_TARGETS):
         # Normalize the differences to find the closest physically valid match in the atlas
@@ -123,7 +135,11 @@ if __name__ == "__main__":
         s_diff = np.abs(ok_df['Sigma'] - s) / max_s
         
         closest_idx = (w_diff + s_diff).idxmin()
-        best_match = ok_df.loc[closest_idx]
+        best_match = viable.loc[closest_idx]
+
+        atlas_R_m  = float(best_match['R_total_Re']) * R_EARTH
+        target_M_kg = TARGET_MASS_MJUP * M_JUPITER
+        g_init = G_CONST * target_M_kg / atlas_R_m**2
         
         tasks.append({
             't_int': t,
